@@ -73,6 +73,7 @@ import { getDefaultSourcePath } from '../core/source-resolver.ts';
 // backs the get_status_snapshot MCP op — must NOT shell out to git).
 import { newestCommitMs, commitTimeMs, lagFromContentMs } from '../core/source-health.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
+import { humanOut } from '../core/human-out.ts';
 import {
   loadOpCheckpoint,
   recordCompleted,
@@ -4577,7 +4578,10 @@ See also:
       return cfg.syncEnabled !== false;
     });
     const disabledCount = sources.length - activeSources.length;
-    const humanSink: NodeJS.WriteStream = jsonOut ? process.stderr : process.stdout;
+    // `humanOut` folds in the MCP-stdio case: under `gbrain serve` stdout
+    // carries JSON-RPC and a progress line there breaks the client's parser
+    // (see core/human-out.ts for the measured failure).
+    const humanSink: NodeJS.WriteStream = humanOut(jsonOut);
     const writeHuman = (line: string) => humanSink.write(line + '\n');
 
     if (disabledCount > 0) {
@@ -5501,7 +5505,9 @@ export async function buildSyncStatusReport(
  */
 export function printSyncStatusReport(
   report: SyncStatusReport,
-  sink: NodeJS.WriteStream = process.stdout,
+  // Default is evaluated per call, so under `gbrain serve` this resolves to
+  // stderr and the table can never splice itself into the JSON-RPC framing.
+  sink: NodeJS.WriteStream = humanOut(),
 ): void {
   const write = (line: string) => sink.write(line + '\n');
   write(`\nSync status — generated ${report.generated_at}`);
@@ -5732,7 +5738,7 @@ async function maybeExtractionNudge(engine: BrainEngine, sourceId?: string): Pro
  * when `--json` is set, so banners stay off stdout and the JSON envelope
  * pipes cleanly through `jq` (D4).
  */
-function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = process.stdout) {
+function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = humanOut()) {
   const write = (line: string) => sink.write(line + '\n');
   switch (result.status) {
     case 'up_to_date':

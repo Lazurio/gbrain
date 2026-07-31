@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { startMcpServer } from '../mcp/server.ts';
+import { claimStdoutForProtocol } from '../core/human-out.ts';
 
 // Maximum time the stdio path will wait for engine.disconnect() (PGLite
 // close + advisory lock release) before forcing exit. Keeps a wedged
@@ -78,6 +79,13 @@ export interface ServeOptions {
   // transport.onclose still cover legitimate shutdown.
   // Defaults to `process.env.MCP_STDIO === '1'` when omitted.
   mcpStdio?: boolean;
+  // Test seam for the stdout hand-over. The real implementation patches the
+  // process-global `console.log`/`info`/`debug` for the lifetime of the
+  // process, which is correct for a real serve but would leak into the test
+  // runner and silently redirect every later test's console output. Same
+  // reasoning as the `startMcpServer` stub above: runServe must not touch the
+  // runner's globals. Defaults to the real `claimStdoutForProtocol`.
+  claimStdout?: () => () => void;
   // Test seam for the boot-readiness deadline (#3273). Milliseconds.
   // Defaults to GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS (seconds; 60 when
   // unset, 0 disables) when omitted.
@@ -152,6 +160,11 @@ export async function runServe(
   // trigger graceful release of the PGLite write lock held by `engine`.
   // The HTTP / OAuth path above has its own lifecycle in serve-http.ts
   // and is intentionally NOT wired into this stdio plumbing.
+  // From here on stdout carries JSON-RPC framing and nothing else. Measured
+  // 2026-08-01: one `  1 chunks created` progress line on stdout killed a live
+  // host's session mid-tool-call — see core/human-out.ts for the full trace.
+  (opts.claimStdout ?? claimStdoutForProtocol)();
+
   console.error('Starting GBrain MCP server (stdio)...');
 
   installStdioLifecycle(engine, args, opts);
