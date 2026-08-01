@@ -1,5 +1,6 @@
-// Covers src/core/human-out.ts — the rule that keeps stdout clean while the
-// MCP stdio transport owns it.
+// Covers src/core/cli-out.ts — the rule that keeps stdout clean while the
+// MCP stdio transport owns it. The axis is WHO READS: a CLI caller reads
+// stdout, an MCP client does not.
 //
 // The defect this pins, measured 2026-08-01 on a fresh host: `sync` wrote its
 // progress line `  1 chunks created` to stdout while running as an MCP tool,
@@ -11,7 +12,7 @@
 // bug can take.
 
 import { describe, expect, test, afterEach } from 'bun:test';
-import { humanOut, humanLog, stdoutIsProtocol, claimStdoutForProtocol } from '../src/core/human-out.ts';
+import { cliOut, cliLog, stdoutIsProtocol, claimStdoutForProtocol } from '../src/core/cli-out.ts';
 
 const KEYS = ['MCP_STDIO', 'GBRAIN_STDOUT_IS_PROTOCOL'] as const;
 const saved = new Map<string, string | undefined>();
@@ -30,24 +31,24 @@ afterEach(() => {
   saved.clear();
 });
 
-describe('stdout is only for humans when no protocol owns it', () => {
-  test('plain CLI run writes human output to stdout', () => {
+describe('stdout is the CLI caller\'s only while no protocol owns it', () => {
+  test('plain CLI run writes its output to stdout', () => {
     for (const key of KEYS) setEnv(key, undefined);
     expect(stdoutIsProtocol()).toBe(false);
-    expect(humanOut()).toBe(process.stdout);
+    expect(cliOut()).toBe(process.stdout);
   });
 
-  test('MCP_STDIO=1 moves human output to stderr', () => {
+  test('MCP_STDIO=1 moves that output to stderr', () => {
     for (const key of KEYS) setEnv(key, undefined);
     setEnv('MCP_STDIO', '1');
     expect(stdoutIsProtocol()).toBe(true);
-    expect(humanOut()).toBe(process.stderr);
+    expect(cliOut()).toBe(process.stderr);
   });
 
   test('the explicit escape hatch works too, for hosts that set neither', () => {
     for (const key of KEYS) setEnv(key, undefined);
     setEnv('GBRAIN_STDOUT_IS_PROTOCOL', '1');
-    expect(humanOut()).toBe(process.stderr);
+    expect(cliOut()).toBe(process.stderr);
   });
 
   test('a value that is not exactly "1" does NOT reserve stdout', () => {
@@ -59,24 +60,24 @@ describe('stdout is only for humans when no protocol owns it', () => {
     expect(stdoutIsProtocol()).toBe(false);
     setEnv('MCP_STDIO', 'true');
     expect(stdoutIsProtocol()).toBe(false);
-    expect(humanOut()).toBe(process.stdout);
+    expect(cliOut()).toBe(process.stdout);
   });
 
-  test('a command in --json mode keeps stdout clean even outside MCP', () => {
+  test('a command in --json mode keeps prose off stdout even outside MCP', () => {
     // The behaviour sync.ts already had before this module existed; folding it
     // in here is what lets call sites ask one question instead of two.
     for (const key of KEYS) setEnv(key, undefined);
-    expect(humanOut(true)).toBe(process.stderr);
+    expect(cliOut(true)).toBe(process.stderr);
   });
 
-  test('humanLog routes by env and adds exactly one newline', () => {
-    // Child process again: humanLog goes through console.log/console.error on
+  test('cliLog routes by env and adds exactly one newline', () => {
+    // Child process again: cliLog goes through console.log/console.error on
     // purpose (see its comment — process.stdout.write is buffered and drops
     // the tail on a prompt exit), and Bun's console writes straight to the fd,
     // so an in-process stub would observe nothing.
     const script = `
-      const { humanLog } = await import('${import.meta.dir}/../src/core/human-out.ts');
-      humanLog('  1 chunks created');
+      const { cliLog } = await import('${import.meta.dir}/../src/core/cli-out.ts');
+      cliLog('  1 chunks created');
     `;
     const plain = Bun.spawnSync(['bun', '-e', script], { stdout: 'pipe', stderr: 'pipe' });
     expect(plain.stdout.toString()).toBe('  1 chunks created\n');
@@ -90,13 +91,13 @@ describe('stdout is only for humans when no protocol owns it', () => {
     expect(mcp.stderr.toString()).toBe('  1 chunks created\n');
   });
 
-  test('humanLog survives a prompt process exit — the tail is not lost', () => {
+  test('cliLog survives a prompt process exit — the tail is not lost', () => {
     // The regression that process.stdout.write introduced and that
     // test/sync-cost-gate caught: a buffered write plus an immediate exit
     // silently drops the summary line a caller was scraping for.
     const r = Bun.spawnSync(['bun', '-e', `
-      const { humanLog } = await import('${import.meta.dir}/../src/core/human-out.ts');
-      humanLog('  7 pages imported');
+      const { cliLog } = await import('${import.meta.dir}/../src/core/cli-out.ts');
+      cliLog('  7 pages imported');
       process.exit(0);
     `], { stdout: 'pipe', stderr: 'pipe' });
     expect(r.stdout.toString()).toContain('7 pages imported');
@@ -112,7 +113,7 @@ describe('claimStdoutForProtocol covers the call sites nobody converted', () => 
   // matters here: did a byte land on fd 1?
   function run(body: string): { stdout: string; stderr: string; code: number } {
     const r = Bun.spawnSync(['bun', '-e', `
-      const { claimStdoutForProtocol } = await import('${import.meta.dir}/../src/core/human-out.ts');
+      const { claimStdoutForProtocol } = await import('${import.meta.dir}/../src/core/cli-out.ts');
       ${body}
     `], { stdout: 'pipe', stderr: 'pipe' });
     return {
@@ -156,13 +157,13 @@ describe('claimStdoutForProtocol covers the call sites nobody converted', () => 
     expect(r.stderr).toContain('error line');
   });
 
-  test('it flips stdoutIsProtocol, so humanOut call sites follow along', () => {
+  test('it flips stdoutIsProtocol, so cliOut call sites follow along', () => {
     for (const key of KEYS) setEnv(key, undefined);
     expect(stdoutIsProtocol()).toBe(false);
     const restore = claimStdoutForProtocol();
     try {
       expect(stdoutIsProtocol()).toBe(true);
-      expect(humanOut()).toBe(process.stderr);
+      expect(cliOut()).toBe(process.stderr);
     } finally { restore(); }
   });
 

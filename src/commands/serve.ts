@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { startMcpServer } from '../mcp/server.ts';
-import { claimStdoutForProtocol } from '../core/human-out.ts';
+import { claimStdoutForProtocol } from '../core/cli-out.ts';
 
 // Maximum time the stdio path will wait for engine.disconnect() (PGLite
 // close + advisory lock release) before forcing exit. Keeps a wedged
@@ -162,7 +162,7 @@ export async function runServe(
   // and is intentionally NOT wired into this stdio plumbing.
   // From here on stdout carries JSON-RPC framing and nothing else. Measured
   // 2026-08-01: one `  1 chunks created` progress line on stdout killed a live
-  // host's session mid-tool-call — see core/human-out.ts for the full trace.
+  // host's session mid-tool-call — see core/cli-out.ts for the full trace.
   (opts.claimStdout ?? claimStdoutForProtocol)();
 
   console.error('Starting GBrain MCP server (stdio)...');

@@ -1,5 +1,10 @@
 /**
- * Where human-readable progress is allowed to go.
+ * Where output meant for a CLI caller is allowed to go.
+ *
+ * The distinction this module draws is about **who is reading**, not about how
+ * human the text is. A CLI caller reads stdout; an MCP client does not — it
+ * reads tool responses, and stdout is its transport. So everything a command
+ * says to a CLI caller, prose and `--json` result alike, belongs here.
  *
  * WHY THIS EXISTS. Under `gbrain serve` (stdio MCP) **stdout carries the
  * JSON-RPC protocol**. Any human-readable line written there is spliced into
@@ -16,11 +21,11 @@
  * the whole agent looked frozen. That is the expensive shape of this bug: not a
  * failure, a success nobody can read.
  *
- * The codebase already had the right instinct for `--json` (see `humanSink` in
- * commands/sync.ts): when stdout belongs to a machine, human lines go to
- * stderr. This module generalises that single rule so every command can ask the
- * same question, and so the MCP case is covered by construction rather than by
- * each caller remembering.
+ * The codebase already had the right instinct for `--json` (see `cliSink` in
+ * commands/sync.ts): when stdout belongs to a machine, chatter goes to stderr.
+ * This module generalises that single rule so every command can ask the same
+ * question, and so the MCP case is covered by construction rather than by each
+ * caller remembering.
  *
  * stderr is never part of the protocol: the MCP server already writes its own
  * lifecycle messages there (`[gbrain-serve] shutdown: …`), and hosts surface it
@@ -33,26 +38,20 @@ export function stdoutIsProtocol(): boolean {
 }
 
 /**
- * The stream human-readable output may use right now.
+ * The stream a CLI caller's output may use right now.
  *
- * Callers that already have their own machine-output mode (`--json`) should OR
- * their flag in: `jsonOut || stdoutIsProtocol() ? process.stderr : humanOut()`
- * reads worse than passing it here, so prefer `humanOut(jsonOut)`.
+ * `machineOutput` is the caller's own `--json` mode: it keeps prose off stdout
+ * so the JSON envelope pipes cleanly through `jq`. Pass it in rather than
+ * writing `jsonOut || stdoutIsProtocol() ? process.stderr : cliOut()` at each
+ * site — one question, asked one way.
  */
-export function humanOut(machineOutput = false): NodeJS.WriteStream {
+export function cliOut(machineOutput = false): NodeJS.WriteStream {
   return machineOutput || stdoutIsProtocol() ? process.stderr : process.stdout;
 }
 
-/**
- * Convenience for the very common `console.log`-shaped call site.
- *
- * "Human" here means *everything that is not the JSON-RPC protocol* — including
- * a command's own `--json` result. Under MCP stdio the caller reads that result
- * through the tool response, never off stdout, so routing it to stderr keeps the
- * framing intact without losing anything.
- */
-export function humanLog(line: string, machineOutput = false): void {
-  // Deliberately console.*, NOT humanOut().write(). Measured while porting
+/** Convenience for the very common `console.log`-shaped call site. */
+export function cliLog(line: string, machineOutput = false): void {
+  // Deliberately console.*, NOT cliOut().write(). Measured while porting
   // import.ts: `process.stdout.write` is buffered, so a command that exits
   // promptly after its summary loses the tail — test/sync-cost-gate caught the
   // `N pages imported` line disappearing. console.log/console.error keep the
@@ -65,7 +64,7 @@ export function humanLog(line: string, machineOutput = false): void {
 /**
  * Hand stdout over to the protocol for the rest of the process.
  *
- * WHY A BLANKET REDIRECT AND NOT 2081 EDITS. `humanOut` above only helps at
+ * WHY A BLANKET REDIRECT AND NOT 2081 EDITS. `cliOut` above only helps at
  * call sites that ask it. `src/` holds ~2000 `console.log` calls, most of them
  * in command paths the MCP tools reach through, and any single one of them is
  * enough to kill a session — this bug reached a live host through exactly one.
@@ -77,7 +76,7 @@ export function humanLog(line: string, machineOutput = false): void {
  * the protocol stream. They cannot be swept the same way: the MCP SDK's
  * StdioServerTransport writes the protocol through that very function, so
  * patching it would redirect the protocol itself. Those call sites must use
- * `humanOut()` — which is why `sync.ts`'s `humanSink` does.
+ * `cliOut()` — which is why `sync.ts`'s `cliSink` does.
  *
  * Idempotent, and returns a restore function so tests can call it without
  * leaking a patched console into the rest of the run.

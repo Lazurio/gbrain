@@ -17,7 +17,7 @@ import {
   type SyncStrategy,
 } from '../core/sync.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
-import { humanLog } from '../core/human-out.ts';
+import { cliLog } from '../core/cli-out.ts';
 import {
   loadCheckpoint,
   saveCheckpoint,
@@ -103,7 +103,7 @@ export async function runImport(
     } catch (e) {
       if (e instanceof EmbeddingCredentialError) {
         if (jsonOutput) {
-          humanLog(JSON.stringify({ status: 'embedding_credentials_missing', diagnosis: e.diagnosis }));
+          cliLog(JSON.stringify({ status: 'embedding_credentials_missing', diagnosis: e.diagnosis }));
         } else {
           console.error('');
           console.error(e.userMessage);
@@ -226,7 +226,7 @@ export async function runImport(
   if (opts.exclude && opts.exclude.length > 0) {
     const beforeExclude = allFiles.length;
     allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(dir, abs), opts.exclude));
-    humanLog(
+    cliLog(
       `Found ${allFiles.length} ${fileTypeLabel} files ` +
       `(${beforeExclude - allFiles.length} excluded by --exclude patterns)`,
     );
@@ -238,7 +238,7 @@ export async function runImport(
       );
     }
   } else {
-    humanLog(`Found ${allFiles.length} ${fileTypeLabel} files`);
+    cliLog(`Found ${allFiles.length} ${fileTypeLabel} files`);
   }
 
   // Sort newest-first so date-prefixed brain paths get embedded before older ones.
@@ -254,7 +254,7 @@ export async function runImport(
     const cp = loadCheckpoint(checkpointPath, dir);
     if (cp) {
       for (const p of cp.completedPaths) completed.add(p);
-      humanLog(`Resuming from checkpoint: skipping ${completed.size} already-processed files`);
+      cliLog(`Resuming from checkpoint: skipping ${completed.size} already-processed files`);
     }
   }
   const files = resumeFilter(allFiles, dir, completed);
@@ -262,7 +262,7 @@ export async function runImport(
   // Determine actual worker count
   const actualWorkers = workerCount > 1 ? workerCount : 1;
   if (actualWorkers > 1) {
-    humanLog(`Using ${actualWorkers} parallel workers`);
+    cliLog(`Using ${actualWorkers} parallel workers`);
   }
 
   let imported = 0;
@@ -436,21 +436,21 @@ export async function runImport(
   if (errors === 0) {
     clearCheckpoint(checkpointPath);
   } else if (existsSync(checkpointPath)) {
-    humanLog(`  Checkpoint preserved (${errors} errors). Run again to retry failed files.`);
+    cliLog(`  Checkpoint preserved (${errors} errors). Run again to retry failed files.`);
   }
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
   if (jsonOutput) {
-    humanLog(JSON.stringify({
+    cliLog(JSON.stringify({
       status: 'success', duration_s: parseFloat(totalTime),
       imported, skipped, errors, chunks: chunksCreated,
       total_files: allFiles.length,
     }));
   } else {
-    humanLog(`\nImport complete (${totalTime}s):`);
-    humanLog(`  ${imported} pages imported`);
-    humanLog(`  ${skipped} pages skipped (${skipped - errors} unchanged, ${errors} errors)`);
-    humanLog(`  ${chunksCreated} chunks created`);
+    cliLog(`\nImport complete (${totalTime}s):`);
+    cliLog(`  ${imported} pages imported`);
+    cliLog(`  ${skipped} pages skipped (${skipped - errors} unchanged, ${errors} errors)`);
+    cliLog(`  ${chunksCreated} chunks created`);
   }
 
   // v0.39 T7 — end-of-run schema mismatch warn. Fires ONCE per import,
