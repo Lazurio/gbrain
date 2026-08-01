@@ -124,6 +124,10 @@ function makeHarness(opts: {
     // are installed *before* this is awaited, so all behaviors are still
     // exercised end-to-end.
     startMcpServer: async () => {},
+    // Same reason as the stub above: the real claim patches the global
+    // console for the rest of the process, which in a test run means every
+    // later test's console.log silently goes to stderr.
+    claimStdout: () => () => {},
     getParentPid: () => parentPid,
     setInterval: timers.setInterval,
     clearInterval: timers.clearInterval,

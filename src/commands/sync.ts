@@ -73,6 +73,7 @@ import { getDefaultSourcePath } from '../core/source-resolver.ts';
 // backs the get_status_snapshot MCP op — must NOT shell out to git).
 import { newestCommitMs, commitTimeMs, lagFromContentMs } from '../core/source-health.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
+import { cliOut } from '../core/cli-out.ts';
 import {
   loadOpCheckpoint,
   recordCompleted,
@@ -4564,7 +4565,7 @@ See also:
     // submit, --serial / --max-sources / --no-auto-embed flags, and feature-
     // flagged the whole thing behind sync.federated_v2. This branch layers
     // additive improvements on top:
-    //   - humanSink swap so `--json` keeps stdout clean (D4)
+    //   - cliSink swap so `--json` keeps stdout clean (D4)
     //   - --skip-failed / --retry-failed reject under parallel>1 (D15 — the
     //     sync-failures.jsonl is brain-global, parallel acks race)
     //   - connection-budget stderr warning at parallel × workers × 2 > 16 (D10)
@@ -4577,11 +4578,14 @@ See also:
       return cfg.syncEnabled !== false;
     });
     const disabledCount = sources.length - activeSources.length;
-    const humanSink: NodeJS.WriteStream = jsonOut ? process.stderr : process.stdout;
-    const writeHuman = (line: string) => humanSink.write(line + '\n');
+    // `cliOut` folds in the MCP-stdio case: under `gbrain serve` stdout
+    // carries JSON-RPC and a progress line there breaks the client's parser
+    // (see core/cli-out.ts for the measured failure).
+    const cliSink: NodeJS.WriteStream = cliOut(jsonOut);
+    const writeCli = (line: string) => cliSink.write(line + '\n');
 
     if (disabledCount > 0) {
-      writeHuman(`Skipping ${disabledCount} disabled source(s).`);
+      writeCli(`Skipping ${disabledCount} disabled source(s).`);
     }
 
     // --missing-path skip: classify sources whose checkout is not on this
@@ -4594,10 +4598,10 @@ See also:
       runnableSources = parts.runnable;
       skippedMissingPath = parts.missing;
       for (const src of skippedMissingPath) {
-        writeHuman(`  ⊘ ${src.name}: skipped — local_path not present on this host (${src.local_path})`);
+        writeCli(`  ⊘ ${src.name}: skipped — local_path not present on this host (${src.local_path})`);
       }
       if (skippedMissingPath.length > 0) {
-        writeHuman(`Skipped ${skippedMissingPath.length} source(s) whose local_path is not present on this host (--missing-path skip).`);
+        writeCli(`Skipped ${skippedMissingPath.length} source(s) whose local_path is not present on this host (--missing-path skip).`);
       }
     }
 
@@ -4736,11 +4740,11 @@ See also:
           const { submitEmbedBackfill } = await import('../core/embed-backfill-submit.ts');
           const sub = await submitEmbedBackfill(engine, src.id, { reason: 'sync_all' });
           if (sub.status === 'submitted') {
-            writeHuman(`  → embed-backfill job ${sub.jobId} queued for ${src.name}`);
+            writeCli(`  → embed-backfill job ${sub.jobId} queued for ${src.name}`);
           } else if (sub.status === 'cooldown') {
-            writeHuman(`  → embed-backfill skipped (cooldown) for ${src.name}`);
+            writeCli(`  → embed-backfill skipped (cooldown) for ${src.name}`);
           } else if (sub.status === 'spend_capped') {
-            writeHuman(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd}) for ${src.name}`);
+            writeCli(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd}) for ${src.name}`);
           }
         } catch (e) {
           process.stderr.write(`  → embed-backfill submission failed for ${src.name}: ${e instanceof Error ? e.message : String(e)}\n`);
@@ -4788,18 +4792,18 @@ See also:
         );
       }
 
-      writeHuman(`\nParallel sync: ${runnableSources.length} sources, ${cap} concurrent workers.\n`);
+      writeCli(`\nParallel sync: ${runnableSources.length} sources, ${cap} concurrent workers.\n`);
       const results = await pMapAllSettled(runnableSources, cap, async (src) => {
         const r = await runOne(src);
         return { name: src.name, result: r };
       });
-      // Print per-source aggregate at the end. humanSink so --json stays clean.
-      writeHuman('\n--- sync --all aggregate ---');
+      // Print per-source aggregate at the end. cliSink so --json stays clean.
+      writeCli('\n--- sync --all aggregate ---');
       for (let i = 0; i < results.length; i++) {
         const r = results[i];
         const src = runnableSources[i];
         if (r.status === 'fulfilled') {
-          writeHuman(`  ✓ ${src.name}: ${r.value.result.status} (added=${r.value.result.added}, modified=${r.value.result.modified}, deleted=${r.value.result.deleted})`);
+          writeCli(`  ✓ ${src.name}: ${r.value.result.status} (added=${r.value.result.added}, modified=${r.value.result.modified}, deleted=${r.value.result.deleted})`);
           perSourceResults.push({
             sourceId: src.id,
             sourceName: src.name,
@@ -4819,10 +4823,10 @@ See also:
       }
     } else {
       for (const src of runnableSources) {
-        writeHuman(`\n--- Syncing source: ${src.name} ---`);
+        writeCli(`\n--- Syncing source: ${src.name} ---`);
         try {
           const result = await runOne(src);
-          printSyncResult(result, humanSink);
+          printSyncResult(result, cliSink);
           perSourceResults.push({
             sourceId: src.id,
             sourceName: src.name,
@@ -5501,7 +5505,9 @@ export async function buildSyncStatusReport(
  */
 export function printSyncStatusReport(
   report: SyncStatusReport,
-  sink: NodeJS.WriteStream = process.stdout,
+  // Default is evaluated per call, so under `gbrain serve` this resolves to
+  // stderr and the table can never splice itself into the JSON-RPC framing.
+  sink: NodeJS.WriteStream = cliOut(),
 ): void {
   const write = (line: string) => sink.write(line + '\n');
   write(`\nSync status — generated ${report.generated_at}`);
@@ -5732,7 +5738,7 @@ async function maybeExtractionNudge(engine: BrainEngine, sourceId?: string): Pro
  * when `--json` is set, so banners stay off stdout and the JSON envelope
  * pipes cleanly through `jq` (D4).
  */
-function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = process.stdout) {
+function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = cliOut()) {
   const write = (line: string) => sink.write(line + '\n');
   switch (result.status) {
     case 'up_to_date':
