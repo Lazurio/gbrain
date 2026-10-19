@@ -39,18 +39,6 @@ const TITLE_HARD_CAP_CHARS = 300;
  */
 const SUMMARY_HARD_CAP_CHARS = 300;
 
-/**
- * Build the `<context>...</context>\n` prefix for a chunk.
- *
- *   title set, synopsis empty  → `<context>{title}\n</context>\n`
- *   title empty, synopsis set  → `<context>\n{synopsis}\n</context>\n`
- *   both set                   → `<context>{title}\n{synopsis}\n</context>\n`
- *   both null/empty            → null (caller should embed raw chunk)
- *
- * Always returns null when both inputs are meaningless. The wrapper text
- * stays asymmetric (document side only) — queries embed clean per Voyage
- * / ZeroEntropy's `inputType: query` distinction.
- */
 export function buildContextualPrefix(
   title: string | null | undefined,
   synopsis: string | null | undefined,
@@ -172,11 +160,16 @@ function escapeRegex(s: string): string {
 
 /**
  * Exported guard for D26 P0-4 verification — given a CRMode, does it
- * NEED Haiku synopsis generation? Used by the service to decide whether
+ * NEED model-generated synopsis generation? Used by the service to decide whether
  * to invoke `page-summary.ts:generatePerChunkSynopsis` per chunk.
  */
-export function modeRequiresHaiku(mode: CRMode): boolean {
+export function modeRequiresSynopsis(mode: CRMode): boolean {
   return mode === 'per_chunk_synopsis';
+}
+
+/** @deprecated Use `modeRequiresSynopsis`. */
+export function modeRequiresHaiku(mode: CRMode): boolean {
+  return modeRequiresSynopsis(mode);
 }
 
 /**

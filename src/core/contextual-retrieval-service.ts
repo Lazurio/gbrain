@@ -19,7 +19,7 @@
  * the lower 'title' tier — discarding the in-progress synopsis vectors so
  * the page's chunks NEVER end up mid-state on disk. Only after PHASE 1
  * completes successfully does PHASE 2 run a single DB transaction to
- * replace all chunks + stamp `contextual_retrieval_mode` +
+ * update the captured chunks' vectors + stamp `contextual_retrieval_mode` +
  * `corpus_generation`. Crash anywhere in PHASE 1 = page-level retry with
  * zero half-state. Crash during PHASE 2 = standard transaction rollback.
  *
@@ -29,12 +29,12 @@
  * propagate the throw up).
  *
  * Per D27 P2-2 the embedBatch call runs ONCE per page after the per-chunk
- * Haiku loop completes, not per-chunk. Saves per-call overhead + reduces
+ * synopsis loop completes, not per-chunk. Saves per-call overhead + reduces
  * failure surface.
  *
  * Rate-leasing is the caller's responsibility (D26 P0-3 — the Minion
- * handler acquires a shared `anthropic:utility:contextual-synopsis` lease
- * per chunk before invoking the service's optional `acquireSynopsisLease`
+ * handler acquires a shared, resolved-model-specific synopsis lease per chunk
+ * before invoking the service's optional `acquireSynopsisLease`
  * / `releaseSynopsisLease` hooks). Inline callers (import-file, reindex
  * command) pass no hooks and rely on the gateway's own rate-limit retry.
  */
@@ -45,12 +45,12 @@ import { embedBatch } from './embedding.ts';
 import { resolveContextualRetrievalMode } from './contextual-retrieval-resolver.ts';
 import {
   buildContextualPrefix,
-  modeRequiresHaiku,
+  modeRequiresSynopsis,
   modeRequiresWrapper,
-  sanitizeTitle,
   wrapChunkForEmbedding,
 } from './embedding-context.ts';
 import {
+  DEFAULT_SYNOPSIS_MODEL,
   generatePerChunkSynopsis,
   SYNOPSIS_PROMPT_VERSION,
   SYNOPSIS_DOC_MAX_CHARS,
@@ -61,6 +61,11 @@ import { runSlidingPool } from './worker-pool.ts';
 import type { BrainEngine } from './engine.ts';
 import type { ChunkInput, CRMode, Page } from './types.ts';
 import type { SourceRow } from './sources-ops.ts';
+import { installPageEmbeddings, readProjectionSnapshot, type ProjectionSnapshot } from './page-state/projections.ts';
+import { reconcileContextualEmbeddingInputs } from './page-state/contextual-proof.ts';
+import { digest } from './persistence/digest.ts';
+import { isLargePageBytes } from './page-size-policy.ts';
+import { isSegmentedPage, pageBodyBytes } from './page-body/page-shape.ts';
 
 /**
  * v3 = chunks embed with optional contextual retrieval wrapper. The
@@ -70,7 +75,6 @@ import type { SourceRow } from './sources-ops.ts';
  * corpus_generation hash.
  */
 export const TITLE_WRAPPER_VERSION = 1;
-const DEFAULT_HAIKU_MODEL = 'anthropic:claude-haiku-4-5-20251001';
 export const DEFAULT_CONTEXTUAL_CHUNK_CONCURRENCY = 4;
 export const MAX_CONTEXTUAL_CHUNK_CONCURRENCY = 16;
 
@@ -108,17 +112,18 @@ function getEmbeddingModelTag(): string {
 }
 
 /**
- * Compose the corpus_generation hash per D27 P1-5. Folds the prompt
- * version + Haiku model + wrapper version + embedding model so a tweak
- * to ANY of those invalidates prior cache rows via the
+ * Compose the corpus_generation hash per D27 P1-5. Per-chunk synopsis
+ * generations fold in the prompt version + synopsis model; title-only
+ * generations retain the historical default-model identity because they do
+ * not call a synopsis model. Both include the wrapper version + embedding
+ * model so a relevant tweak invalidates prior cache rows via the
  * `query_cache.page_generations` LEFT JOIN.
  *
  * Pure function — `embedding_dimensions` and `embedding_column` stay in
  * the existing KNOBS_HASH_VERSION space per A6 in the eng-review pass.
  */
-export function computeCorpusGeneration(args: {
+export type ComputeCorpusGenerationArgs = {
   crMode: CRMode;
-  haikuModel: string;
   /**
    * Resolved `SYNOPSIS_DOC_MAX_CHARS` for per_chunk_synopsis runs. When
    * present, folded into the hash so changes to
@@ -128,13 +133,31 @@ export function computeCorpusGeneration(args: {
    * back-compat with pre-cap embeddings.
    */
   synopsisDocMaxChars?: number;
-}): string {
+} & (
+  | {
+      /** Canonical provider-neutral synopsis model identifier. */
+      synopsisModel: string;
+      /** @deprecated Use `synopsisModel`. Ignored when both are present. */
+      haikuModel?: string;
+    }
+  | {
+      synopsisModel?: undefined;
+      /** @deprecated Use `synopsisModel`. */
+      haikuModel: string;
+    }
+);
+
+export function computeCorpusGeneration(args: ComputeCorpusGenerationArgs): string {
+  const synopsisModel =
+    args.crMode === 'per_chunk_synopsis'
+      ? args.synopsisModel ?? args.haikuModel
+      : DEFAULT_SYNOPSIS_MODEL;
   const h = createHash('sha256')
     .update(args.crMode)
     .update('|')
     .update(String(SYNOPSIS_PROMPT_VERSION))
     .update('|')
-    .update(args.haikuModel)
+    .update(synopsisModel)
     .update('|')
     .update(String(TITLE_WRAPPER_VERSION))
     .update('|')
@@ -155,7 +178,24 @@ export function computeCorpusGeneration(args: {
  * Matches what the inline import path writes for its title-tier pages.
  */
 export function titleTierCorpusGeneration(): string {
-  return computeCorpusGeneration({ crMode: 'title', haikuModel: DEFAULT_HAIKU_MODEL });
+  return computeCorpusGeneration({ crMode: 'title', synopsisModel: DEFAULT_SYNOPSIS_MODEL });
+}
+
+/**
+ * #3883: resolve the synopsis output-token cap from the
+ * `models.synopsis_max_tokens` config key. Returns undefined when unset or
+ * invalid so generatePerChunkSynopsis falls back to its SYNOPSIS_MAX_TOKENS
+ * default (200). Clamped to a sane range (16..8192); fail-open on config
+ * errors (a config read failure must never block a re-embed).
+ */
+export async function resolveSynopsisMaxTokens(engine: BrainEngine): Promise<number | undefined> {
+  try {
+    const raw = await engine.getConfig('models.synopsis_max_tokens');
+    if (raw == null || raw === '') return undefined;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 16 && n <= 8192) return Math.floor(n);
+  } catch { /* fail-open to the page-summary default */ }
+  return undefined;
 }
 
 /**
@@ -172,7 +212,7 @@ export function computeSourceTextHash(sourceText: string): string {
  * `kind`:
  *
  *   success → all chunks embedded + page stamped, DB transaction committed
- *   skipped → mode='none' OR page has no chunks; no DB writes
+ *   skipped → missing/deleted, or mode='none'/no chunks with a guarded context stamp
  *   page_fallback → PHASE 1 detected a refusal/empty/malformed; restarted
  *      at lower tier; final tier in `mode_applied` is what landed
  *   transient_error → caller should retry (Minion job retries; inline
@@ -188,7 +228,7 @@ export type ReembedPageResult =
     }
   | {
       kind: 'skipped';
-      reason: 'mode_none' | 'no_chunks' | 'page_missing' | 'soft_deleted';
+      reason: 'mode_none' | 'no_chunks' | 'page_missing' | 'soft_deleted' | 'budget_limited' | 'page_body_segmented';
     }
   | {
       kind: 'page_fallback';
@@ -223,10 +263,17 @@ export interface ReembedPageArgs {
    * already in `content_chunks` continue serving queries.
    */
   killSwitchDisabled?: boolean;
+  /** Resolved provider-neutral model used for per-chunk synopsis generation. */
+  synopsisModel?: string;
   /**
-   * Optional Haiku model override. When unset, page-summary.ts falls back
-   * to its default (Haiku 4.5). Threaded so eval / future per-source
-   * model overrides can choose a different model.
+   * #3883: output-token cap for each synopsis call. When omitted, the
+   * `models.synopsis_max_tokens` config is read once per page; when that is
+   * unset too, page-summary's SYNOPSIS_MAX_TOKENS default (200) applies.
+   */
+  synopsisMaxTokens?: number;
+  /**
+   * @deprecated Use `synopsisModel`. Retained for callers compiled against
+   * the pre-provider-neutral service shape.
    */
   haikuModel?: string;
   /** Optional abort signal threaded into gateway.chat + embedBatch. */
@@ -240,10 +287,12 @@ export interface ReembedPageArgs {
   releaseSynopsisLease?: (lease?: unknown) => Promise<void>;
   /**
    * Intra-page per-chunk synopsis concurrency. 1 preserves the legacy
-   * sequential loop exactly; higher values only parallelize Haiku synopsis
+   * sequential loop exactly; higher values only parallelize synopsis
    * calls. Embedding remains one batch after all synopses succeed.
    */
   chunkConcurrency?: number;
+  /** @internal Synopsis generator seam (benchmark caching/metering); production callers omit this. */
+  generateSynopsis?: typeof generatePerChunkSynopsis;
 }
 
 /**
@@ -254,15 +303,50 @@ export async function reembedPageWithContextualRetrieval(
   args: ReembedPageArgs,
 ): Promise<ReembedPageResult> {
   // ── Load page + source + chunks ────────────────────────────────────
-  const page = await args.engine.getPage(args.pageSlug, { sourceId: args.sourceId });
-  if (!page) {
+  const initial = await args.engine.getPage(args.pageSlug, { sourceId: args.sourceId });
+  if (!initial) {
     return { kind: 'skipped', reason: 'page_missing' };
   }
-  if (page.deleted_at != null) {
+  if (initial.deleted_at != null) {
     return { kind: 'skipped', reason: 'soft_deleted' };
   }
+  // Wave B: a segmented page's vectors come from its stale chunk rows (page-body/segmented-embedding.ts); its contextual
+  // synopsis per segment is spec 8.6. Nothing is stamped: its vectors were not rebuilt under this mode.
+  if (isSegmentedPage(initial)) return { kind: 'skipped', reason: 'page_body_segmented' };
 
-  const source = await loadSourceRow(args.engine, args.sourceId);
+  const prepared = await readProjectionSnapshot(args.engine, args.pageSlug, args.sourceId, { allowUnsealed: true });
+  if (!prepared) return { kind: 'skipped', reason: 'page_missing' };
+  const page = prepared.snapshot.page;
+  const source = await loadSourceRow(args.engine, page.source_id);
+  const superseded: ReembedPageResult = { kind: 'transient_error', cause: 'db',
+    detail: 'The page projection or contextual policy changed during preparation; retry from its current snapshot.' };
+  // The same guarded completion publishes vectors and their context together.
+  // Metadata-only branches also compare the raw inventory, including empty or
+  // intentionally unsealed pages; those chunks never reach a provider.
+  const publish = async (mode: CRMode, generation: string | null, embedded?: ChunkInput[]): Promise<ReembedPageResult | null> => {
+    try {
+      const installed = await args.engine.transaction(async tx => {
+        await tx.lockPageKeys([{ sourceId: page.source_id, slug: page.slug }]);
+        if (digest(sourcePolicy(await loadSourceRow(tx, page.source_id))) !== digest(sourcePolicy(source))) return false;
+        if (embedded) {
+          if (!(await installPageEmbeddings(tx, prepared, embedded.map(chunk => ({ ...chunk, model: prepared.embeddingModel ?? undefined })),
+            undefined, { tier: mode, corpusGeneration: generation })).complete) return false;
+        } else {
+          const current = await readProjectionSnapshot(tx, page.slug, page.source_id, { allowUnsealed: true });
+          if (!sameProjection(prepared, current)) return false;
+        }
+        await tx.updatePageContextualRetrievalState(page.slug, page.source_id, mode, generation);
+        if (!embedded && mode === 'none' && page.contextual_retrieval_mode == null
+          && !Object.hasOwn(page.frontmatter ?? {}, 'embed_skip')) {
+          await reconcileContextualEmbeddingInputs(tx, prepared.snapshot, mode, generation);
+        }
+        return true;
+      });
+      return installed ? null : superseded;
+    } catch (err) {
+      return { kind: 'transient_error', cause: 'db', detail: err instanceof Error ? err.message : String(err) };
+    }
+  };
 
   // ── Resolve effective mode (D5+D6+D15+D18) ─────────────────────────
   const resolution = resolveContextualRetrievalMode({
@@ -280,31 +364,26 @@ export async function reembedPageWithContextualRetrieval(
   // the page is up-to-date relative to current global state — prevents
   // the reindex sweep from re-walking pages that are already aligned.
   if (resolution.mode === 'none') {
-    await args.engine.updatePageContextualRetrievalState(
-      args.pageSlug,
-      args.sourceId,
-      'none',
-      null,
-    );
+    const failure = await publish('none', null);
+    if (failure) return failure;
     return { kind: 'skipped', reason: 'mode_none' };
   }
 
-  const chunks = await args.engine.getChunks(args.pageSlug, { sourceId: args.sourceId });
+  const chunks = prepared.chunks;
   if (chunks.length === 0) {
     // No chunks but page exists (frontmatter-only or empty). Stamp the
     // column anyway so subsequent reindex sweeps don't keep visiting.
-    await args.engine.updatePageContextualRetrievalState(
-      args.pageSlug,
-      args.sourceId,
-      resolution.mode,
+    const failure = await publish(resolution.mode,
       computeCorpusGeneration({
         crMode: resolution.mode,
-        haikuModel: args.haikuModel ?? DEFAULT_HAIKU_MODEL,
+        synopsisModel: args.synopsisModel ?? args.haikuModel ?? DEFAULT_SYNOPSIS_MODEL,
         synopsisDocMaxChars: resolution.mode === 'per_chunk_synopsis' ? SYNOPSIS_DOC_MAX_CHARS : undefined,
       }),
     );
+    if (failure) return failure;
     return { kind: 'skipped', reason: 'no_chunks' };
   }
+  if (page.text_projection_revision !== prepared.snapshot.revision) return superseded;
 
   // ── PHASE 1: in-memory build (no DB writes) ────────────────────────
   // Iterate at most twice — once at the requested tier, once at the
@@ -312,8 +391,18 @@ export async function reembedPageWithContextualRetrieval(
   // fall-back path is the D14 page-level consistency guarantee: a
   // single bad chunk demotes the whole page to title-only so all
   // chunks on the page share the same wrapper shape.
-  const haikuModel = args.haikuModel ?? DEFAULT_HAIKU_MODEL;
-  let attemptMode: CRMode = resolution.mode;
+  const synopsisModel = args.synopsisModel ?? args.haikuModel ?? DEFAULT_SYNOPSIS_MODEL;
+  // #3883: explicit arg wins; else the models.synopsis_max_tokens config;
+  // else undefined → page-summary's SYNOPSIS_MAX_TOKENS default (200).
+  const synopsisMaxTokens =
+    args.synopsisMaxTokens ?? (await resolveSynopsisMaxTokens(args.engine));
+  // Large pages: the title tier until per-chunk synopses are metered per page
+  // (plan B8), and no re-embed while the per-page cap holds or capped the page.
+  const large = isLargePageBytes(pageBodyBytes(page));
+  if (large && (await args.engine.executeRaw(`SELECT 1 FROM page_embedding_budget WHERE page_id = $1 AND state <> 'open'`, [page.id])).length) {
+    return { kind: 'skipped', reason: 'budget_limited' };
+  }
+  let attemptMode: CRMode = large && resolution.mode === 'per_chunk_synopsis' ? 'title' : resolution.mode;
   let fallbackReason: SynopsisFailureKind | null = null;
 
   // eslint-disable-next-line no-constant-condition
@@ -323,33 +412,20 @@ export async function reembedPageWithContextualRetrieval(
       page,
       chunks: chunks as ChunkInput[],
       args,
-      haikuModel,
+      synopsisModel,
+      synopsisMaxTokens,
     });
 
     if (phase1.kind === 'success') {
       const corpus_generation = computeCorpusGeneration({
         crMode: attemptMode,
-        haikuModel,
+        synopsisModel,
         synopsisDocMaxChars: attemptMode === 'per_chunk_synopsis' ? SYNOPSIS_DOC_MAX_CHARS : undefined,
       });
 
       // ── PHASE 2: single DB transaction ───────────────────────────
-      try {
-        await args.engine.transaction(async (tx) => {
-          await tx.upsertChunks(args.pageSlug, phase1.embeddedChunks, {
-            sourceId: args.sourceId,
-          });
-          await tx.updatePageContextualRetrievalState(
-            args.pageSlug,
-            args.sourceId,
-            attemptMode,
-            corpus_generation,
-          );
-        });
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        return { kind: 'transient_error', cause: 'db', detail };
-      }
+      const failure = await publish(attemptMode, corpus_generation, phase1.embeddedChunks);
+      if (failure) return failure;
 
       if (fallbackReason != null) {
         return {
@@ -424,22 +500,25 @@ async function tryBuildPhase1(opts: {
   page: Page;
   chunks: ChunkInput[];
   args: ReembedPageArgs;
-  haikuModel: string;
+  synopsisModel: string;
+  /** #3883: resolved output-token cap (undefined → page-summary default). */
+  synopsisMaxTokens?: number;
 }): Promise<Phase1Result> {
-  const { attemptMode, page, chunks, args, haikuModel } = opts;
+  const { attemptMode, page, chunks, args, synopsisModel, synopsisMaxTokens } = opts;
 
   // Build the wrapper prefix for THIS page. Title-only tier: one prefix
   // reused across all chunks. per_chunk_synopsis tier: prefix is built
-  // per-chunk with the chunk-specific Haiku synopsis.
-  const safeTitle = sanitizeTitle(page.title);
+  // per-chunk with the chunk-specific generated synopsis.
+  // buildContextualPrefix sanitizes once, as every embedding writer and embedding-input-hash.ts do.
+  const title = page.title;
 
-  if (attemptMode === 'title' || !modeRequiresHaiku(attemptMode)) {
-    // Title-only path. No Haiku calls; pure string concat.
+  if (attemptMode === 'title' || !modeRequiresSynopsis(attemptMode)) {
+    // Title-only path. No synopsis-model calls; pure string concat.
     // Use compiled_truth first sentences as a free pseudo-summary when
     // the title tier wants slightly more context — but per D2 the
     // balanced default is title-only without summary. Keep it pure for
     // now; the title block alone is what 'balanced' ships.
-    const prefix = buildContextualPrefix(safeTitle, null);
+    const prefix = buildContextualPrefix(title, null);
     const wrappedTexts = chunks.map((c) =>
       modeRequiresWrapper(attemptMode)
         ? wrapChunkForEmbedding(c.chunk_text, prefix, c.chunk_source)
@@ -482,10 +561,11 @@ async function tryBuildPhase1(opts: {
       wrappedTexts[i] = await buildWrappedChunkText({
         chunk: c,
         sourceText,
-        safeTitle,
+        title,
         page,
         args,
-        haikuModel,
+        synopsisModel,
+        synopsisMaxTokens,
       });
     },
   });
@@ -529,12 +609,14 @@ class ChunkSynopsisPhase1Error extends Error {
 async function buildWrappedChunkText(opts: {
   chunk: ChunkInput;
   sourceText: string;
-  safeTitle: string;
+  title: string;
   page: Page;
   args: ReembedPageArgs;
-  haikuModel: string;
+  synopsisModel: string;
+  /** #3883: resolved output-token cap (undefined → page-summary default). */
+  synopsisMaxTokens?: number;
 }): Promise<string> {
-  const { chunk: c, sourceText, safeTitle, page, args, haikuModel } = opts;
+  const { chunk: c, sourceText, title, page, args, synopsisModel, synopsisMaxTokens } = opts;
 
   // Code chunks always bypass the wrapper (D20-T4) — pass through.
   if (c.chunk_source === 'fenced_code') {
@@ -562,15 +644,16 @@ async function buildWrappedChunkText(opts: {
       }
       leaseAcquired = true;
     }
-    synopsisResult = await generatePerChunkSynopsis({
+    synopsisResult = await (args.generateSynopsis ?? generatePerChunkSynopsis)({
       documentText: sourceText,
       chunkText: c.chunk_text,
       pageTitle: page.title,
       pageSlug: args.pageSlug,
       sourceId: args.sourceId,
       chunkIndex: c.chunk_index,
-      model: haikuModel,
+      model: synopsisModel,
       abortSignal: args.abortSignal,
+      maxTokens: synopsisMaxTokens,
     });
   } finally {
     if (leaseAcquired && args.releaseSynopsisLease) {
@@ -584,7 +667,7 @@ async function buildWrappedChunkText(opts: {
   }
 
   if (synopsisResult.kind === 'success') {
-    const prefix = buildContextualPrefix(safeTitle, synopsisResult.synopsis);
+    const prefix = buildContextualPrefix(title, synopsisResult.synopsis);
     return wrapChunkForEmbedding(c.chunk_text, prefix, c.chunk_source);
   }
 
@@ -652,17 +735,42 @@ function readSourceTextWithFallback(page: Page, chunks: ChunkInput[]): string {
     .join('\n\n');
 }
 
-async function loadSourceRow(engine: BrainEngine, sourceId: string): Promise<SourceRow> {
+/**
+ * Load one source row with the CR-relevant columns. Exported for reuse by
+ * the import path (#3885: stored `sources set-cr-mode` must apply on
+ * capture/reindex, not just the Minion backfill) and the conversation-parser
+ * body reader (#3911: relative raw_transcript resolves against the OWNING
+ * source's local_path). Throws SourceRowNotFoundError when the source id is
+ * unknown, so callers can tell a missing row from a failed read.
+ */
+export class SourceRowNotFoundError extends Error {}
+
+export async function loadSourceRow(engine: BrainEngine, sourceId: string): Promise<SourceRow> {
   const rows = await engine.executeRaw<SourceRow>(
     `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at,
             contextual_retrieval_mode, trust_frontmatter_overrides
      FROM sources WHERE id = $1`,
     [sourceId],
   );
-  if (rows.length === 0) {
-    throw new Error(`Source not found: ${sourceId}`);
+  // A missing result set (unit-test engine doubles) reads as no row.
+  if (!rows?.length) {
+    throw new SourceRowNotFoundError(`Source not found: ${sourceId}`);
   }
   return rows[0];
+}
+
+function sourcePolicy(source: SourceRow) {
+  return { id: source.id, mode: source.contextual_retrieval_mode ?? null,
+    trustFrontmatter: source.trust_frontmatter_overrides ?? false };
+}
+
+function sameProjection(prepared: ProjectionSnapshot, current: ProjectionSnapshot | null): boolean {
+  return current !== null && current.snapshot.revision === prepared.snapshot.revision
+    && current.snapshot.sourceIncarnation === prepared.snapshot.sourceIncarnation
+    && current.snapshot.page.id === prepared.snapshot.page.id
+    && current.snapshot.page.text_projection_revision === prepared.snapshot.page.text_projection_revision
+    && current.indexingContext === prepared.indexingContext
+    && digest(current.chunks) === digest(prepared.chunks);
 }
 
 function classifyEmbedError(err: unknown, detail: string): Phase1Transient | Phase1Permanent {
