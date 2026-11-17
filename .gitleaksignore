@@ -45,3 +45,32 @@ a3140831d22a944947ef9cbd72ff7129a3541951:test/large-pages/credential-reseal-segm
 # Large-pages hardening (h): the synthetic marker constant 'quillfeather7731' in test/pathological/lp-h-purge-orphan-segment-text.test.ts
 # (commit 3bf9794) was named TOKEN and reads as generic-api-key; the tree now names it MARKER. History-only fingerprint, not a secret.
 3bf97940832d3c7d9dbc4815cedb30dcc83cb550:test/pathological/lp-h-purge-orphan-segment-text.test.ts:generic-api-key:37
+# #7073 (GBRA-147): synthetic OAuth token literals in test/google-api-access-cmd-7073.serial.test.ts (commit fb1cee45) read as
+# generic-api-key; the tree now builds them at runtime. These history-only fingerprints are not secrets.
+fb1cee45c18357eb43d537715b2a8dc43fafc70f:test/google-api-access-cmd-7073.serial.test.ts:generic-api-key:37
+fb1cee45c18357eb43d537715b2a8dc43fafc70f:test/google-api-access-cmd-7073.serial.test.ts:generic-api-key:55
+# #7483 (GBRA-190): the dummy header marker in test/connectors-header-redaction-7483.test.ts (commit e670a328) read as
+# generic-api-key; the tree now names it MARKER. This history-only fingerprint is not a secret.
+e670a32809a7038c9a63d9dfbf4480f8ab545db2:test/connectors-header-redaction-7483.test.ts:generic-api-key:25
+# #8107 pregate cache-key allowlist (GBRA-218): synthetic ghp_-shaped probes in test/pregate-allowlist-cache-keys.test.ts (commit eb4ffd05)
+# read as github-pat; the tree now builds them at runtime. These history-only fingerprints are not secrets.
+eb4ffd053fa032905b93b4e8e7a66e8ae89a721c:test/pregate-allowlist-cache-keys.test.ts:github-pat:41
+eb4ffd053fa032905b93b4e8e7a66e8ae89a721c:test/pregate-allowlist-cache-keys.test.ts:github-pat:42
+# Storage manifest: synthetic credential-shaped values in test/storage-manifest.test.ts's storage_register refusal cases
+# (abcdef123-style placeholders the shelf must refuse) read as generic-api-key. History-only fingerprints, not secrets.
+ba2de3bd8def8d8e6f76c328830391a4459eb506:test/storage-manifest.test.ts:generic-api-key:136
+ba2de3bd8def8d8e6f76c328830391a4459eb506:test/storage-manifest.test.ts:generic-api-key:137
+ba2de3bd8def8d8e6f76c328830391a4459eb506:test/storage-manifest.test.ts:generic-api-key:147
+d7a54effbc2e4ab26496bebb0d680ec5b82aaeed:test/storage-manifest.test.ts:generic-api-key:138
+d7a54effbc2e4ab26496bebb0d680ec5b82aaeed:test/storage-manifest.test.ts:generic-api-key:139
+d7a54effbc2e4ab26496bebb0d680ec5b82aaeed:test/storage-manifest.test.ts:generic-api-key:149
+f60d3d827947be5836e7a1ab530596494f3f4e25:test/storage-manifest.test.ts:generic-api-key:141
+f60d3d827947be5836e7a1ab530596494f3f4e25:test/storage-manifest.test.ts:generic-api-key:142
+f60d3d827947be5836e7a1ab530596494f3f4e25:test/storage-manifest.test.ts:generic-api-key:143
+# Conversation archive (GST-2768): synthetic Gateway tokens (tok-synthetic-000N) in test/transcripts-openclaw-gateway-argv.test.ts
+# and a synthetic redaction canary constant in test/transcripts-archive-redaction.test.ts read as generic-api-key.
+# History-only fingerprints of test fixtures, not secrets.
+abef0b6d4b3c475ab8a6ab991744562f1f579a4f:test/transcripts-openclaw-gateway-argv.test.ts:generic-api-key:105
+abef0b6d4b3c475ab8a6ab991744562f1f579a4f:test/transcripts-openclaw-gateway-argv.test.ts:generic-api-key:124
+5cdad604afa992a5af330606719f41299d05c29f:test/transcripts-openclaw-gateway-argv.test.ts:generic-api-key:34
+8d727757c32db0479ebc33e48c3ac6cb8a7f023c:test/transcripts-archive-redaction.test.ts:generic-api-key:31

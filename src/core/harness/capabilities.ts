@@ -168,18 +168,21 @@ export type RescopeTarget = { kind: 'oauth_client'; id: string } | { kind: 'lega
 
 /**
  * The host commands that lift snapshot and client-pin blockers. They differ by
- * credential type: tokens refresh their snapshot (`--refresh-operations`
- * previews, `--add` widens by exactly the named operations); clients have no
- * refresh, so they take an explicit `--operations` list plus `--surface full`
- * when their stored surface blocks too. `operations` fills the list; null
- * leaves the `<OPERATIONS>` placeholder for the owner to choose. `all` is the
+ * credential type: tokens refresh their snapshot (`--add` widens by exactly
+ * the named operations); clients have no refresh, so they take an explicit
+ * `--operations` list plus `--surface full` when their stored surface blocks
+ * too. Each preview is the apply command with `--dry-run`, so it prints the
+ * grant before and after. `operations` fills the list; null leaves the
+ * `<OPERATIONS>` placeholder for the owner to choose, and a token's preview is
+ * then a bare `--refresh-operations` listing the candidates. `all` is the
  * disclosed no-snapshot choice, never the default repair.
  */
 export function grantRescopeArgvs(target: RescopeTarget, gaps: Pick<GrantGaps, 'snapshotExcluded' | 'pinExcluded'> & Partial<Pick<GrantGaps, 'approvalExcluded'>>, operations: string | null) {
   const value = operations ?? '<OPERATIONS>';
   if (target.kind === 'legacy_token') {
     const base = ['gbrain', 'auth', 'rescope', ...target.flag];
-    return { preview: [...base, '--refresh-operations'], apply: [...base, '--refresh-operations', '--add', value],
+    const apply = [...base, '--refresh-operations', '--add', value];
+    return { preview: operations === null ? [...base, '--refresh-operations'] : [...apply, '--dry-run'], apply,
       all_operations: [...base, '--reset-default', 'operations', '--dry-run'] };
   }
   const base = ['gbrain', 'auth', 'rescope', '--client', target.id];
@@ -320,8 +323,11 @@ export async function resolveGrantDiagnosis(auth: AuthInfo, engine: BrainEngine,
     ? await readClientCatalogProvenance(engine, principal.id, allowedOperations) : null;
   const target: RescopeTarget | null = !principal ? null
     : principal.kind === 'oauth_client' ? { kind: 'oauth_client', id: principal.id } : { kind: 'legacy_token', flag: ['--id', principal.id] };
-  return describeGrantDiagnosis(gaps, { hasSnapshot: allowedOperations !== null, provenance, clientSurface,
-    clientSurfaceSetBy: auth.surfaceSetBy ?? null, serverSurface, target });
+  // GBRA-218: the member identity the credential reads as (member, groups, may_act_for).
+  const { credentialAccessView } = await import('../access/caller.ts');
+  const { member, groups, may_act_for } = await credentialAccessView(engine, auth);
+  return { ...describeGrantDiagnosis(gaps, { hasSnapshot: allowedOperations !== null, provenance, clientSurface,
+    clientSurfaceSetBy: auth.surfaceSetBy ?? null, serverSurface, target }), member, groups, may_act_for };
 }
 
 /** Same filters as dispatch/tool advertisement, evaluated once per discovery
@@ -379,6 +385,7 @@ export function describeAuthCapabilities(auth: AuthInfo, options: { surface?: st
     surface: options.surface ?? auth.surface ?? 'full',
     source_id: auth.sourceId ?? null,
     federated_read: auth.allowedSources ?? [],
+    private_pages: auth.privatePages ?? { mode: 'none', sources: [] },
     allowed_operations: auth.allowedOperations ?? null,
     ...(options.visibleOperations ? { available_operations: options.visibleOperations } : {}),
     shared_skills: {

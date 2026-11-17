@@ -6,9 +6,10 @@ import { isImageFilePath, type ImportResult } from '../import-file.ts';
 import { loadConfig } from '../config.ts';
 import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
-import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission } from './page-mutations.ts';
+import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission,
+  withLiveSearchable } from './page-mutations.ts';
 import { admitBatch } from './page-batch.ts';
 import { writeOutcomeUnknown } from './admission-retry.ts';
 import { assertPersistenceAccepting, waitForWrites } from './service.ts';
@@ -26,6 +27,7 @@ import { pageSnapshotKey } from '../page-snapshot-batch.ts';
 import type { WorktreeBinding } from './ownership.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
+import { writeThroughConfigured } from './switches.ts';
 
 /** One file of a managed import batch: its path and the source-relative path its slug is derived from. */
 export interface ManagedImportFile { filePath: string; sourcePath: string }
@@ -74,6 +76,18 @@ type PendingImport = ManagedImportIntent & { request_id: string; source_id: stri
  */
 type StoredImport = Omit<PendingImport, 'content'> & { content?: string };
 
+/**
+ * #7085: with `sync.write_through` off a page write records no worktree, and a managed import publishes only through
+ * the source's canonical owner, so every file would be admitted and then refused. The import refuses once, before any admission.
+ */
+export async function managedImportWriteThroughRefusal(engine: BrainEngine, sourceId: string): Promise<OperationError | null> {
+  if (writeThroughConfigured(await engine.getConfig('sync.write_through'))) return null;
+  return opError('owner_unavailable', 'Managed import publishes through the canonical owner, and sync.write_through is off on this brain.',
+    `Nothing was imported and no write was admitted. Copy the files into source ${sourceId}'s checkout, commit them, then run gbrain sync --source ${sourceId}.`,
+    { detail: 'disabled_by_config', retryable: false, fix: { argv: ['gbrain', 'sync', '--source', sourceId], consent: [], actor: 'agent',
+      why: `Imports the files committed in source ${sourceId}'s checkout; run it after committing them.`, requires_exclusive: false } });
+}
+
 export async function importManagedFile(engine: BrainEngine, filePath: string, sourcePath: string,
   opts: { sourceId?: string; noEmbed?: boolean; activePack?: ImportPack; signal?: AbortSignal; slugRoot?: string } = {}): Promise<ImportResult> {
   const [settled] = await importManagedFiles(engine, [{ filePath, sourcePath }], opts);
@@ -100,7 +114,7 @@ export async function importManagedFiles(engine: BrainEngine, files: readonly Ma
   const fail = (i: number, reason: unknown) => { settled[i] = { status: 'rejected', reason }; };
   const sourceId = opts.sourceId ?? 'default';
   const binding = await getWorktreeBinding(engine, sourceId);
-  const unowned = !binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active'
+  const unowned = !binding?.local_path || binding.owner_host_id !== hostIdFor(engine) || binding.state !== 'active'
     ? opError('owner_unavailable', 'Managed import must run on the active canonical owner for the selected source.',
       `This host is not the active owner of source ${sourceId}, so nothing was imported. Run the import on the owner host that writer status names, or wait until its owner is active.`,
       { fix: readFix(`Shows source ${sourceId}'s owner host and state, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] }) }) : null;
@@ -213,6 +227,9 @@ async function importPlanned(ctx: OperationContext, binding: WorktreeBinding,
       const value = outcome.value;
       done(member.i, { slug: String(value.slug), status: value.status as ImportResult['status'], chunks: Number(value.chunks ?? 0),
         ...(typeof value.error === 'string' ? { error: value.error } : {}),
+        ...(value.searchable !== undefined ? { searchable: value.searchable as ImportResult['searchable'] } : {}),
+        ...(value.searchable === 'pending' ? { projection: 'pending' as const, request_id: String(value.request_id),
+          searchable_retry_after_ms: Number(value.searchable_retry_after_ms), searchable_fix: value.searchable_fix as ImportResult['searchable_fix'] } : {}),
         ...(value.type_warning ? { type_warning: value.type_warning as ImportResult['type_warning'] } : {}) });
       return;
     }
@@ -266,14 +283,15 @@ async function submitManagedImports(ctx: OperationContext, batch: string, params
   }
   rows.sort((a, b) => a.index - b.index);
   const done = await waitForWrites(ctx.engine, rows.map(entry => entry.row), ctx.config, IMPORT_WAIT_MS * rows.length);
-  rows.forEach((entry, position) => {
+  await Promise.all(rows.map(async (entry, position) => {
     try {
-      const response = pendingAwareResponse(ctx, done[position]!);
+      // #7106: a new segmented page over 4 MiB replies at commit with `searchable: 'pending'`, read live here.
+      const response = await withLiveSearchable(ctx, pendingAwareResponse(ctx, done[position]!));
       if (entry.admitted) emitFenceNotice(ctx, response, done[position]!.slug);
       settled[entry.index] = { status: 'fulfilled', value: { ...response, ...(entry.typeWarning ? { type_warning: entry.typeWarning } : {}),
         ...(entry.slugAdvisory ? { slug_advisory: entry.slugAdvisory } : {}) } };
     } catch (reason) { settled[entry.index] = { status: 'rejected', reason }; }
-  });
+  }));
   return settled;
 }
 

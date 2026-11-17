@@ -43,7 +43,7 @@ const writerProfile = () => resolveGrantProfile({ profile: 'memory-writer', sour
 async function legacyWriter(name: string): Promise<string> {
   const profile = writerProfile();
   const created = await provider.registerClientManual(name, ['client_credentials'], 'read write', [], 'default', undefined, undefined, undefined,
-    { ...profile, surface: 'starter', allowedOperations: profile.allowedOperations!.filter(op => op !== 'put_pages') });
+    { ...profile, surface: 'starter', surfaceSetBy: 'operator', allowedOperations: profile.allowedOperations!.filter(op => op !== 'put_pages') });
   await engine.executeRaw("UPDATE oauth_grant_audit SET after_grant = after_grant - 'catalogProvenance' WHERE client_id = $1", [created.clientId]);
   return created.clientId;
 }
@@ -101,7 +101,7 @@ describe('grant_new_ops_available', () => {
     const found = grants((await checkGrantNewOps(engine, { cfg })).details);
     const token = found.find(f => f.kind === 'legacy_token')!;
     const client = found.find(f => f.id === clientId)!;
-    expect(token.preview_argv).toEqual(['gbrain', 'auth', 'rescope', '--token', 'old-token', '--refresh-operations']);
+    expect(token.preview_argv).toEqual(['gbrain', 'auth', 'rescope', '--token', 'old-token', '--refresh-operations', '--add', 'put_pages', '--dry-run']);
     expect(token.argv).toEqual(['gbrain', 'auth', 'rescope', '--token', 'old-token', '--refresh-operations', '--add', 'put_pages']);
     expect(token.argv).not.toContain('--client');
     expect(client.argv).not.toContain('--refresh-operations');
@@ -117,7 +117,7 @@ describe('grant_new_ops_available', () => {
     const first = await mintLegacyToken(engine, { name: 'twin-token', scopes: ['read', 'write'], takesHolders: ['world'], allowedOperations: ops });
     await mintLegacyToken(engine, { name: 'twin-token', scopes: ['read', 'write'], takesHolders: ['world'], allowedOperations: ops });
     const found = grants((await checkGrantNewOps(engine, { cfg })).details);
-    expect(found.find(f => f.id === first.id)!.preview_argv).toEqual(['gbrain', 'auth', 'rescope', '--id', first.id, '--refresh-operations']);
+    expect(found.find(f => f.id === first.id)!.preview_argv).toEqual(['gbrain', 'auth', 'rescope', '--id', first.id, '--refresh-operations', '--add', 'put_pages', '--dry-run']);
   });
 
   test('the fix asks the user, previews first, and never defaults to --operations all', async () => {

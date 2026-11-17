@@ -7,6 +7,7 @@
  * cron default) plus the decision between both routes, with an estimate stated at its basis.
  */
 import type { BrainEngine } from './engine.ts';
+import { withRequestConfigSnapshot } from './config-snapshot.ts';
 import { AGENT_TOOL_LIMIT_MS, type Action, type Decision } from './agent-output.ts';
 import { cliRouting, pinRouting, type FixRouting } from './fix-routing.ts';
 import { extractionLagStatement, heldLinkExtractionStatement } from './engine-sql/pages.ts';
@@ -15,6 +16,8 @@ import { previewMentionPass } from './mentions/stale.ts';
 import { readMentionPolicy } from './mentions/policy.ts';
 import { resolveEnvNumber, warnOnceForEnv } from './env-number.ts';
 import { isMissingSchemaObject } from './utils.ts';
+import { managedPersistenceEnabled } from './persistence/ownership.ts';
+import { resolveIncludeFrontmatter } from './extract-frontmatter.ts';
 import { LINK_HOLD_THRESHOLD_RUNS, linkExtractionRetryFix } from './persistence/links-extraction-holds.ts';
 
 /** Warn threshold (percent of live pages actionable-stale); `GBRAIN_EXTRACTION_LAG_WARN_PCT` overrides it. */
@@ -42,24 +45,43 @@ export interface ExtractionLag {
   mention_last_pass_at: string | null;
 }
 
+/**
+ * GBRA-133: one config snapshot answers the watermark, the mention policy and the schema pack (one statement instead
+ * of five), and the lag count and the mention preview are issued together, so the whole read is two round trips.
+ */
 export async function readExtractionLag(engine: BrainEngine, opts: { sourceId?: string; timeoutMs?: number } = {}): Promise<ExtractionLag> {
-  const versionTs = await effectiveLinkExtractorWatermark(engine);
-  const read = async (attendance: boolean, held: boolean) => {
-    const { text, params } = extractionLagStatement({ sourceId: opts.sourceId, versionTs, attendance, held });
+  return withRequestConfigSnapshot(engine, async () => {
+    const [row, mention] = await Promise.all([readLagRow(engine, opts),
+      readMentionPolicy(engine).then(policy => policy.enabled ? previewMentionPass(engine, opts.sourceId) : null)]);
+    return { total: Number(row?.total ?? 0), actionable: Number(row?.stale ?? 0), attendance_blocked: Number(row?.attendance_blocked ?? 0), held: Number(row?.held ?? 0),
+      mention_due: mention ? mention.due : null, mention_last_pass_at: mention?.last_pass_at ?? null };
+  });
+}
+
+async function readLagRow(engine: BrainEngine, opts: { sourceId?: string; timeoutMs?: number }) {
+  // #9295: count the wanted rows the configured sweep re-resolves (a managed or frontmatter sweep: every producer). The
+  // managed-mode read needs no config, so it goes out with the config read rather than one round trip before the count.
+  const [versionTs, managed] = await Promise.all([effectiveLinkExtractorWatermark(engine), managedPersistenceEnabled(engine)]);
+  const wantedProducers = managed || await resolveIncludeFrontmatter(engine) ? undefined : ['body'];
+  const read = async (attendance: boolean, held: boolean, guests: boolean) => {
+    const { text, params } = extractionLagStatement({ sourceId: opts.sourceId, versionTs, attendance, held, guests, wantedProducers });
     return (await engine.executeRaw<{ total: number; stale: number; attendance_blocked: number; held: number }>(text, params, { timeoutMs: opts.timeoutMs ?? 10_000 }))[0];
   };
-  let row;
-  try { row = await read(true, true); } catch (e) {
-    if (isMissingSchemaObject(e, 'column', 'links_extract_failure')) row = await read(true, false).catch(async inner => {
-      if (!isMissingSchemaObject(inner, 'column', 'links_attendance_blocked_revision')) throw inner;
-      return read(false, false);
-    });
-    else if (isMissingSchemaObject(e, 'column', 'links_attendance_blocked_revision')) row = await read(false, false);
-    else throw e;
+  const readShape = async (guests: boolean) => {
+    try { return await read(true, true, guests); } catch (e) {
+      if (isMissingSchemaObject(e, 'column', 'links_extract_failure')) return read(true, false, guests).catch(async inner => {
+        if (!isMissingSchemaObject(inner, 'column', 'links_attendance_blocked_revision')) throw inner;
+        return read(false, false, guests);
+      });
+      if (isMissingSchemaObject(e, 'column', 'links_attendance_blocked_revision')) return read(false, false, guests);
+      throw e;
+    }
+  };
+  // GBRA-504: guest pages are never extracted, so they are not lag; a brain behind the guest-notes migration has no guest_sources table.
+  try { return await readShape(true); } catch (e) {
+    if (!isMissingSchemaObject(e, 'table', 'guest_sources')) throw e;
+    return readShape(false);
   }
-  const mention = (await readMentionPolicy(engine)).enabled ? await previewMentionPass(engine, opts.sourceId) : null;
-  return { total: Number(row?.total ?? 0), actionable: Number(row?.stale ?? 0), attendance_blocked: Number(row?.attendance_blocked ?? 0), held: Number(row?.held ?? 0),
-    mention_due: mention ? mention.due : null, mention_last_pass_at: mention?.last_pass_at ?? null };
 }
 
 /**

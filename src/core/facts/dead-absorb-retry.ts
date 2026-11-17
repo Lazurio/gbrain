@@ -25,13 +25,18 @@ export const MAX_RESUBMITS_PER_PASS = 20;
 export const RESUBMIT_SPACING_MS = 60 * 60_000;
 const WRITE_KEY_PREFIX = 'facts-absorb:write:';
 
+/** The idempotency key of the facts-absorb job a page write's facts-backstop effect submits. */
+export function factsAbsorbWriteKey(requestId: string): string {
+  return `${WRITE_KEY_PREFIX}${requestId}`;
+}
+
 export type DeadAbsorbClass = 'provider' | 'config' | 'not_retryable';
 
 /**
  * Provider and configuration failures clear on their own or with an operator fix; everything else stays dead.
  * Extraction failures carry `[facts-extract] <reason> (model=..) (cause=<class> <global llm class>)` (extract.ts):
  * provider_error and chat_unavailable are retryable; refusal, content filter, malformed or truncated output fail the
- * same way on the same page text.
+ * same way on the same page text, and so does a provider_error whose success response could not be parsed (#9466).
  */
 export function classifyDeadFactsAbsorb(errorText: string | null | undefined): DeadAbsorbClass {
   const text = errorText ?? '';
@@ -40,6 +45,7 @@ export function classifyDeadFactsAbsorb(errorText: string | null | undefined): D
   if (extract) {
     if (extract[1] === 'chat_unavailable') return 'config';
     if (extract[1] !== 'provider_error') return 'not_retryable';
+    if (/\(cause=[^)]*\bprovider_response_unparseable\b/.test(text)) return 'not_retryable';
     return /\(cause=[^)]*\b(auth|billing|model_not_found)\b/.test(text) ? 'config' : 'provider';
   }
   if (/chat_unavailable|no usable provider key|not servable|model[_ ]not[_ ]found|billing|insufficient[_ ]quota|credit/i.test(text)) return 'config';
@@ -116,7 +122,11 @@ async function reconcile(engine: BrainEngine, opts: { apply: boolean; record?: b
     if (row.status !== 'dead') continue;
     const cls = classifyDeadFactsAbsorb(row.error_text);
     const known = state.keys[row.idempotency_key];
-    if (cls === 'not_retryable' && !known) { result.not_retryable.push({ job_id: Number(row.id), slug: row.slug }); continue; }
+    if (cls === 'not_retryable' && known?.class !== 'not_retryable') {
+      delete state.keys[row.idempotency_key];
+      result.not_retryable.push({ job_id: Number(row.id), slug: row.slug });
+      continue;
+    }
     state.keys[row.idempotency_key] = known ?? newEntry(row, cls, opts.now);
   }
   const due: string[] = [];

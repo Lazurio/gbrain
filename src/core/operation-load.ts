@@ -11,6 +11,8 @@
  */
 import type { Operation } from './ops/contract.ts';
 import { withOutputRedaction } from './search/output-redaction.ts';
+import { withEngineScope } from './engine-scope.ts';
+import { withGuestMarks } from './guests/marker.ts';
 import { OPERATION_LOADERS } from './operation-loaders.generated.ts';
 
 // ---------------------------------------------------------------------------
@@ -31,20 +33,20 @@ const OP_AREAS: Record<string, string> = {
   synthesize: 'memory-verbs', forget: 'memory-verbs',
   context_pack: 'memory-verbs', delta: 'memory-verbs',
   // pages (CRUD, versions, raw payloads, resolution)
-  get_page: 'pages', put_page: 'pages', delete_page: 'pages', list_pages: 'pages',
-  restore_page: 'pages', purge_deleted_pages: 'pages',
+  get_page: 'pages', put_page: 'pages', delete_page: 'pages', list_pages: 'pages', find_pages: 'pages',
+  restore_page: 'pages', purge_deleted_pages: 'pages', promote_guest_note: 'pages',
   get_versions: 'pages', revert_version: 'pages',
-  resolve_slugs: 'pages', get_chunks: 'pages',
+  resolve_slugs: 'pages', whois: 'pages', get_chunks: 'pages',
   put_raw_data: 'pages', get_raw_data: 'pages',
   fetch: 'pages', // #4039 deep-research read adapter (search/fetch pair)
   // search
-  search: 'search', query: 'search', search_by_image: 'search', assemble_evidence: 'search',
+  search: 'search', search_exact: 'search', query: 'search', search_by_image: 'search', assemble_evidence: 'search',
   // tags
   add_tag: 'tags', remove_tag: 'tags', get_tags: 'tags',
   // links + graph
   add_link: 'links', remove_link: 'links', get_links: 'links',
   get_backlinks: 'links', list_link_sources: 'links', traverse_graph: 'links',
-  find_orphans: 'links',
+  find_orphans: 'links', rank_entities: 'links',
   wanted_pages: 'links',
   // timeline
   add_timeline_entry: 'timeline', get_timeline: 'timeline',
@@ -71,17 +73,19 @@ const OP_AREAS: Record<string, string> = {
   advisor: 'advisor',
   // sources
   sources_add: 'sources', sources_list: 'sources', sources_remove: 'sources',
-  sources_status: 'sources',
+  sources_status: 'sources', sources_resolve_path: 'sources',
   // sync (localOnly)
   sync_brain: 'sync',
   // ingest log
   log_ingest: 'ingest', get_ingest_log: 'ingest',
   get_usage: 'admin',
   // files (localOnly)
-  file_list: 'files', file_upload: 'files', file_url: 'files',
+  storage_find: 'storage', storage_get: 'storage', storage_list: 'storage',
+  file_list: 'files', file_upload: 'files', file_url: 'files', file_register: 'files', file_verify: 'files',
   // jobs (Minions + agent lane)
-  submit_job: 'jobs', get_job: 'jobs', list_jobs: 'jobs', cancel_job: 'jobs',
-  retry_job: 'jobs', get_job_progress: 'jobs', pause_job: 'jobs',
+  submit_job: 'jobs', get_job: 'jobs', wait_job: 'jobs', list_jobs: 'jobs', cancel_job: 'jobs',
+  retry_job: 'jobs', get_job_progress: 'jobs', pause_job: 'jobs', watch_job: 'jobs', list_watches: 'jobs', unwatch: 'jobs',
+  watch_write_request: 'jobs', watch_cron: 'jobs', accept_wakeshift_terms: 'jobs',
   resume_job: 'jobs', replay_job: 'jobs', send_job_message: 'jobs',
   submit_agent: 'jobs', get_agent_job: 'jobs',
   // takes + think
@@ -89,6 +93,7 @@ const OP_AREAS: Record<string, string> = {
   takes_scorecard: 'takes', takes_calibration: 'takes',
   // hot memory (facts)
   extract_facts: 'memory', forget_fact: 'memory', confirm_memory: 'memory',
+  memory_recall: 'memory', memory_write: 'memory', memory_propose: 'memory', // GST-359: QM's memory provider pair
   // entity extraction lane
   extract_entities: 'entities', extraction_pending: 'entities',
   extraction_review: 'entities',
@@ -123,7 +128,10 @@ export function finalizeOperation(op: Operation): void {
   if (op.area === undefined && OP_AREAS[op.name] !== undefined) {
     op.area = OP_AREAS[op.name];
   }
-  op.handler = withOutputRedaction(op);
+  // The handler runs in its engine's scope, so an embedded engine's AI calls use that engine's gateway (engine-scope.ts).
+  // Redaction runs after the guest stamp, so a key-like sender label in a guest mark is redacted like stored text.
+  const handler = withOutputRedaction({ handler: withGuestMarks(op, op.handler), outputRedaction: op.outputRedaction });
+  op.handler = (ctx, params) => withEngineScope(ctx.engine, () => handler(ctx, params));
 }
 
 /** The finalized operation named `name`, loading only the module that defines it. */

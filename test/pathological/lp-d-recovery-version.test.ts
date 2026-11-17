@@ -2,8 +2,8 @@
  * LPH (d) part 1: a recovery record of a version this gbrain does not know is refused, never misread.
  *
  * 1. Protects: a withdrawal-mirror effect recovery record (persistence_effects.recovery) or a write request recovery
- *    record (persistence_requests.recovery) whose `version` this binary does not know (a synthetic version 3, as a
- *    future release could write) is refused `recovery_version_unsupported` with fix.next `tell_user_to_run`
+ *    record (persistence_requests.recovery) whose `version` this binary does not know (a synthetic effect version 3 or
+ *    request version 4, as a future release could write) is refused `recovery_version_unsupported` with fix.next `tell_user_to_run`
  *    `gbrain upgrade`, before anything reads it: the record stays byte for byte, its streamed stage stays on disk with
  *    its bytes, the canonical file keeps its bytes, nothing is cleared and the effect keeps retrying (never parks). The
  *    head blocker names it as needing intervention with the same upgrade fix.
@@ -100,8 +100,9 @@ for (const kind of testBackends()) {
         const start = (await read()).attempts;
         // A reader that misreads the record may clear it; the wait ends then too, and the assertions below say so.
         await waitFor(async () => { await pass(); const row = await read(); return !row.recovery || row.attempts >= start + 7; }, { timeoutMs: 120_000, intervalMs: 100, label: 'seven recovery attempts' });
-        await waitFor(async () => (await read()).state !== 'running', { timeoutMs: 30_000, label: 'the effect released' });
-        const effect = await read();
+        // The row the wait read: the resident consumer may claim the effect again right after it is released.
+        let effect = await read();
+        await waitFor(async () => (effect = await read()).state !== 'running', { timeoutMs: 30_000, label: 'the effect released' });
         // Untouched: the record (byte for byte), its stage, the canonical file and the reserved capacity.
         expect(json(effect!.recovery)).toEqual(written);
         expect(existsSync(written.staging.publication.path)).toBe(true);
@@ -143,11 +144,11 @@ for (const kind of testBackends()) {
       } finally { installFaultHook(undefined); }
     }, 600_000);
 
-    test('a version 3 write request recovery record is refused by staging upgrade, file listing and clearing, and left as it is', async () => {
+    test('a version 4 write request recovery record is refused by staging upgrade, file listing and clearing, and left as it is', async () => {
       const [request] = await brain.engine.executeRaw<{ id: string; request_id: string; worktree_id: string }>(
         `SELECT id::text AS id, request_id::text AS request_id, worktree_id::text AS worktree_id FROM persistence_requests WHERE source_id=$1 AND state='committed' AND worktree_id IS NOT NULL ORDER BY sequence DESC LIMIT 1`, [brain.sourceId]);
       // No staging: a version 1 reader's upgradeRecoveryStaging would allocate a restoration stage from `before` and rewrite the record.
-      const record = { version: 3, path: fileOf(brain, SEGMENTED), root: brain.root, before: Buffer.from('prior bytes').toString('base64'), beforeHash: sha(Buffer.from('prior bytes')),
+      const record = { version: 4, path: fileOf(brain, SEGMENTED), root: brain.root, before: Buffer.from('prior bytes').toString('base64'), beforeHash: sha(Buffer.from('prior bytes')),
         afterHash: sha(readFileSync(fileOf(brain, SEGMENTED))), mode: null, ownerEpoch: '1', attempt: randomUUID(), next: { layout: 'future' } };
       // The request protocol trigger admits only the record shapes this schema knows; a newer gbrain's would come with its
       // own schema, so the trigger is set aside for this one write (replica role) to model that brain.

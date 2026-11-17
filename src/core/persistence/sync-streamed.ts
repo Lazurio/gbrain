@@ -28,6 +28,8 @@ import { sizeStateField } from '../page-embedding-budget.ts';
 import { readPageBodyPolicy } from '../page-body/limits.ts';
 import { importStreamedMarkdownFile, type StreamedPreparedImport } from '../page-body/streamed-import.ts';
 import { ownerImportTrust } from '../trust/channel.ts';
+import { isSourceDbOnlySlug } from './source-storage.ts';
+import { storedLabelsToKeep } from './label-edit.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { sealSegmentedPage } from './segmented-apply.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
@@ -37,6 +39,8 @@ import { recordSyncImportProvenance, type SyncImportProvenanceBase } from './syn
 import type { WriteRequest } from './model.ts';
 import type { SyncIntent, SyncPreparedMutation } from './sync-prepare.ts';
 import { bindOrigin } from './origin-guard.ts';
+import { segmentedOutcome } from './searchable.ts';
+import { isQuarantined } from '../quarantine.ts';
 
 /** A frozen Markdown file over the single-string ceiling: the bytes the owner streams and verifies. */
 export interface SyncBodyRef { kind: 'git_blob' | 'input_file'; sha256: string; bytes: number; blob_oid: string }
@@ -72,6 +76,8 @@ export interface StreamedSyncContext {
   snapshot: PageSnapshot | null; base: PageSnapshot | null;
   renamed?: SyncRename;
   activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
+  /** GBRA-217: the file's reason from its pass's trailer scan, and its history-gap marker. */
+  history?: import('../page-state/versions.ts').VersionHistory;
   importProvenance: SyncImportProvenanceBase;
   validate: (tx: BrainEngine) => Promise<void>;
   releaseHold: (tx: BrainEngine) => Promise<void>;
@@ -99,13 +105,19 @@ export async function prepareManagedSyncStreamed(engine: BrainEngine, row: Write
   if (!filePath || !stat || stat.size !== ref.bytes) throw changed();
   let ready: StreamedPreparedImport | undefined;
   enterClaimStep(ctx.clock, 'import_content', undefined, 'fs');
-  const result = await importStreamedMarkdownFile(engine, filePath, p.sourcePath, { sourceId: row.source_id, noEmbed: true, ...(ctx.activePack ? { activePack: ctx.activePack } : {}),
+  const result = await importStreamedMarkdownFile(engine, filePath, p.sourcePath, { sourceId: row.source_id, noEmbed: true, ...(ctx.activePack ? { activePack: ctx.activePack } : {}), history: ctx.history,
     coordinated: { snapshot: base, sha256: ref.sha256, slug: row.slug, moved: !!renamed, prepare: async value => { ready = value; return value.result; },
       owner: { kind: 'sync', principalKind: row.principal_kind, principalId: row.principal_id, baseRevision: base?.revision ?? null } } }, stat, policy)
     .catch(error => { throw error instanceof OperationError && error.code === 'source_changed' ? changed() : error; });
   if (!ready) throw result.refusal ? ctx.contentRefusal(result.refusal) : refuse('invalid_params', result.error ?? 'The sync file could not be prepared.',
     `The file could not be prepared as page ${row.slug}.`);
   const prepared: StreamedPreparedImport = ready;
+  // GST-2519: a streamed import cannot carry the db_only label keep (sync-prepare.ts withStoredLabels), so a file that
+  // would drop a privacy label its page holds is held until the file states it.
+  const kept = base && !base.page.deleted_at && isSourceDbOnlySlug(ctx.root, row.slug, 'not_db_only')
+    ? storedLabelsToKeep(base.page.frontmatter as Record<string, unknown>, prepared.frontmatter as Record<string, unknown>) : [];
+  if (kept.length) throw ctx.contentRefusal({ code: 'visibility_noncanonical',
+    message: `Page ${row.slug} sits under a declared storage.db_only directory and holds privacy labels (${kept.join(', ')}) that ${p.sourcePath} does not state; a file this large imports without keeping them, so it is held instead of widening the page. State those labels in the file's frontmatter and commit.` });
   if (prepared.observedRevision !== (base?.revision ?? null)) throw refuse('revision_conflict', 'The page changed during sync preparation.',
     `Page ${renamed?.slug ?? row.slug} changed while this sync was being prepared.`);
   const source = { sourceId: row.source_id };
@@ -123,7 +135,7 @@ export async function prepareManagedSyncStreamed(engine: BrainEngine, row: Write
       // The page moves first, keeping its id, links and history; the import prepared at the new path then applies to it.
       if (renamed && await tx.updateSlug(renamed.slug, row.slug, source) !== 1) throw refuse('page_identity_changed', 'The renamed page could not move to its new slug.',
         `Page ${renamed.slug} could not move to ${row.slug}.`);
-      await prepared.apply(tx);
+      const applied = await prepared.apply(tx);
       // An unchanged body keeps its chunks (the no-op required a sealed page), so the move's new revision is sealed here.
       if (renamed && prepared.noop) await sealSegmentedPage(tx, renamed.pageId);
       await bindOrigin(tx, { sourceId: row.source_id, slug: row.slug, sourcePath: p.sourcePath });
@@ -138,7 +150,7 @@ export async function prepareManagedSyncStreamed(engine: BrainEngine, row: Write
       const live = final && final.page.deleted_at == null ? final.page : null;
       return { status: renamed ? 'renamed' : prepared.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
         chunks: prepared.result.chunks, noop: prepared.noop && !renamed, imported_file: true, ...(renamed ? { renamed_from: renamed.slug } : {}),
-        ...(prepared.noop ? {} : await sizeStateField(tx, row.source_id, row.slug, live)) };
+        ...(prepared.noop ? {} : { ...await sizeStateField(tx, row.source_id, row.slug, live), ...segmentedOutcome(applied?.segmented, isQuarantined(prepared.frontmatter)) }) };
     } };
   return mutation;
 }

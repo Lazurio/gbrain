@@ -10,15 +10,17 @@
  * `connector_held_items` stay connector-only.
  */
 import type { BrainEngine } from '../engine.ts';
+import { CONNECTOR_KINDS_SQL } from './connector-kinds.ts';
 import { opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { CONNECTOR_STOPPED_RUNS, readManagedConnectorState, type ConnectorPurgedItem, type ConnectorRunCounts, type ConnectorRunFailure, type UpgradeRecovery } from './connector-state.ts';
 import { classifySyncFault, type SyncFaultVerdict } from './sync-fault-class.ts';
-import type { Action } from '../agent-output.ts';
+import { cliRenderContext, renderAction, type Action } from '../agent-output.ts';
 import { managedBrain, readAllSourceHolds } from '../connectors/item-holds-store.ts';
 import type { ItemHoldRecord } from '../connectors/item-holds.ts';
 import { fenceAutoRepairFor, gitHoldItem, readGitHoldListing, readSyncConversions, readSyncHoldPolicy, type GitHoldItem, type SyncConversion } from './sync-holds.ts';
 import { holdLine } from '../../commands/sync-diagnostics.ts';
+import { pageSortedRows, type ListingRequest } from '../bounded-listing.ts';
 
 /** Fix wave 4: `sources status` lists this many held items per source, then "+N more". */
 export const HELD_STATUS_LIMIT = 10;
@@ -60,7 +62,7 @@ function connectorFailureFix(sourceId: string, failure: ConnectorRunFailure): Ac
 /** #6831: the connector run failure recorded for a source (null for a non-connector source or a last run that finished). */
 export async function readConnectorLastError(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string): Promise<ConnectorLastError | null> {
   const [source] = await engine.executeRaw<{ incarnation: string }>(
-    "SELECT incarnation::text FROM sources WHERE id=$1 AND NOT archived AND config->>'kind' IN ('google','github')", [sourceId]);
+    `SELECT incarnation::text FROM sources WHERE id=$1 AND NOT archived AND config->>'kind' IN (${CONNECTOR_KINDS_SQL})`, [sourceId]);
   const failure = source ? (await readManagedConnectorState(engine, sourceId, source.incarnation)).last_failure : null;
   if (!failure) return null;
   return { ...failure, stopped: failure.consecutive >= CONNECTOR_STOPPED_RUNS, ...classifySyncFault({ code: failure.code, message: failure.message }),
@@ -69,7 +71,7 @@ export async function readConnectorLastError(engine: Pick<BrainEngine, 'executeR
 
 export async function readConnectorSourceStatuses(engine: Pick<BrainEngine, 'executeRaw'>, sourceIds?: string[]): Promise<Map<string, ConnectorSourceStatus>> {
   const sources = await engine.executeRaw<{ id: string; incarnation: string }>(
-    "SELECT id,incarnation::text FROM sources WHERE NOT archived AND config->>'kind' IN ('google','github') AND ($1::text[] IS NULL OR id=ANY($1::text[]))",
+    `SELECT id,incarnation::text FROM sources WHERE NOT archived AND config->>'kind' IN (${CONNECTOR_KINDS_SQL}) AND ($1::text[] IS NULL OR id=ANY($1::text[]))`,
     [sourceIds ?? null]);
   const statuses = new Map<string, ConnectorSourceStatus>();
   for (const source of sources) {
@@ -176,6 +178,41 @@ export async function readGitHoldStatuses(engine: Pick<BrainEngine, 'executeRaw'
       sync_argv: ['gbrain', 'sync', '--source', sourceId, ...(managed ? ['--no-pull'] : [])] });
   }
   return out;
+}
+
+/**
+ * #7326: what `sources status --json` lists of a source's held files. `summary` (the default): the count, the
+ * counts per code with one example each, and the first HELD_STATUS_LIMIT items; `all` (`--holds`): every item read;
+ * `page` (`--limit` / `--cursor`): one keyset page of items ordered by path.
+ */
+export type GitHoldListing = { mode: 'summary' } | { mode: 'all' } | { mode: 'page'; request: ListingRequest };
+
+/** Held items per code, largest first, each with its first item as the example (its fix and docs apply to the rest). */
+function holdsByCode<T extends { code: string }>(items: readonly T[]): Array<{ code: string; count: number; example: T }> {
+  const groups = new Map<string, { code: string; count: number; example: T }>();
+  for (const item of items) {
+    const group = groups.get(item.code);
+    if (group) group.count++;
+    else groups.set(item.code, { code: item.code, count: 1, example: item });
+  }
+  return [...groups.values()].sort((a, b) => b.count - a.count || (a.code < b.code ? -1 : 1));
+}
+
+/** A source's `git_holds` for `sources status --json`, summary first and items last, bounded by `listing`; each fix rendered with the CLI routing pin (#9319). */
+export function gitHoldStatusJson(sourceId: string, status: GitHoldStatus, listing: GitHoldListing) {
+  const ctx = cliRenderContext();
+  const { items: held, ...rest } = status;
+  const items = held.map(item => ({ ...item, fix: renderAction(item.fix, ctx) }));
+  const head = { ...rest, by_code: holdsByCode(items) };
+  if (listing.mode === 'all') return { ...head, items };
+  if (listing.mode === 'page') {
+    const page = pageSortedRows(items, item => [item.path], listing.request, `sources_status_git_holds:${sourceId}`);
+    const next = page.next_cursor === null ? null
+      : ['gbrain', 'sources', 'status', sourceId, '--json', '--limit', String(page.limit), '--cursor', page.next_cursor];
+    return { ...head, returned: page.returned, limit: page.limit, complete: page.complete, next_cursor: page.next_cursor, next_command: next, items: page.rows };
+  }
+  if (items.length <= HELD_STATUS_LIMIT) return { ...head, items };
+  return { ...head, items_complete: false, items_command: ['gbrain', 'sources', 'status', sourceId, '--json', '--holds'], items: items.slice(0, HELD_STATUS_LIMIT) };
 }
 
 /** Held files: up to HELD_STATUS_LIMIT per source with each one's next step, then the re-screen and retry commands; then recent conversions. */

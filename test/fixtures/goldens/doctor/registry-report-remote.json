@@ -167,6 +167,10 @@
       },
       {
         "category": "brain",
+        "name": "synopsis_tier_coverage"
+      },
+      {
+        "category": "brain",
         "name": "text_projection_readiness"
       },
       {
@@ -196,6 +200,10 @@
       {
         "category": "brain",
         "name": "derived_visibility"
+      },
+      {
+        "category": "brain",
+        "name": "privacy_label_ignored"
       },
       {
         "category": "brain",
@@ -251,6 +259,14 @@
       },
       {
         "category": "ops",
+        "name": "dream_write_deferred"
+      },
+      {
+        "category": "ops",
+        "name": "embedding_restamp_stalled"
+      },
+      {
+        "category": "ops",
         "name": "writer_version"
       },
       {
@@ -272,6 +288,10 @@
       {
         "category": "ops",
         "name": "stale_embedding_effects"
+      },
+      {
+        "category": "brain",
+        "name": "fact_bulk_dates"
       }
     ],
     "early_returns_after": [

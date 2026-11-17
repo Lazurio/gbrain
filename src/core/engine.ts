@@ -6,6 +6,8 @@ import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './sea
 import type { KeywordPageWindow } from './search/keyword-statement.ts';
 import type { EmbeddingState, EmbeddingStateCounts, EmbeddingStateRow } from './embedding-state.ts';
 import type { DerivedLinkBatchItem, DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
+import type { FindPagesQuery, FoundPages } from './page-find.ts';
+import type { PageCountQuery, PageCounts, TypeGrouper } from './page-counts.ts';
 export type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions, PageMutationPrecondition, PageWithdrawal } from './page-state/types.ts';
 import type {
   Page, PageInput, PageFilters, GetPageOpts, PageReadScope, PageReadPolicy,
@@ -139,6 +141,22 @@ export interface BatchOpts {
  */
 export interface TransactionOptions {
   signal?: AbortSignal;
+  /**
+   * GBRA-156: Postgres behind a transaction-mode pooler (transaction pipelining on) sends the transaction's first
+   * statement with BEGIN instead of a round trip later, when this accepts its text. If BEGIN fails that statement runs
+   * in autocommit, so pass only a test that accepts a read or a transaction-local set_config, never a write
+   * (`isPersistenceDeclaration`). Ignored by PGLite and inside a transaction.
+   */
+  pipelineFirst?: (statement: string) => boolean;
+  /**
+   * GBRA-156: Postgres on a pool that pipelines inside a transaction sends every statement this accepts, in order,
+   * behind BEGIN before BEGIN's answer; the first it refuses, and every later one, waits for the answer. If BEGIN fails
+   * the accepted statements run in autocommit, so pass only a test that accepts reads and transaction-local
+   * set_config (`isPipelinableSearchRead`). Ignored by PGLite and inside a transaction.
+   */
+  pipelineEarly?: (statement: string) => boolean;
+  /** GBRA-156: Postgres opens `BEGIN READ ONLY` (a write inside fails with 25006); search's reads pass it. Ignored by PGLite and when nested. */
+  readOnly?: boolean;
 }
 
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -325,6 +343,16 @@ export interface TakesListOpts extends PageReadPolicy {
   /** Per-token MCP allow-list. Server applies AND holder = ANY($takesHoldersAllowList) when set. */
   takesHoldersAllowList?: string[];
   sortBy?: 'weight' | 'since_date' | 'created_at';
+  /** With `sortBy: 'since_date'`, oldest first (default newest first). */
+  oldestFirst?: boolean;
+  /**
+   * Only takes made on or before this ISO date (YYYY-MM-DD): a take with no
+   * since_date is left out, and one in ISO form (YYYY-MM-DD, or YYYY-MM read as
+   * the 15th) after the date is left out; any other form is kept for the caller.
+   */
+  sinceOnOrBefore?: string;
+  /** Takes with no take_grade_cache row for this prompt version and judge come first. */
+  ungradedFirst?: { promptVersion: string; judgeModelId: string };
   limit?: number;
   offset?: number;
   /** Federated/source scope via the take's page.source_id. Array wins over
@@ -345,12 +373,16 @@ export interface TakeHit {
   kind: TakeKind;
   holder: string;
   weight: number;
+  since_date: string | null;
+  until_date: string | null;
+  source: string | null;
   score: number;            // search rank score (ts_rank for keyword, 1-cos_dist for vector)
 }
 
 import type { StaleTakeOpts, StaleTakeRow, TakeEmbeddingInput } from './takes-row-types.ts';
 import type { BodyFlipInput, BodyFlipResult, BodyRegion, BodyStagingInput, BodyStagingState, ManifestRow, ManifestRowInput, SegmentChunkInput,
   SegmentedPageMeta, SegmentSweepOptions, SegmentSweepResult, SegmentTextInput } from './page-body/types.ts';
+import type { SegmentDerivationInput, SegmentDerivationKind, SegmentDerivationRow } from './page-body/derivations.ts';
 export type { StaleTakeOpts, StaleTakeRow, TakeEmbeddingInput } from './takes-row-types.ts';
 
 /** Resolution metadata for resolveTake. */
@@ -563,6 +595,8 @@ export interface FactRow {
   /** #5575: the stored trust tier and write origin (absent on brains before the trust migration). */
   trust_tier?: import('./trust/tier.ts').TrustTier;
   write_origin?: Record<string, unknown> | null;
+  /** The typed claim columns (NewFact.claim_*), each set only when the row stores it. */
+  claim_metric?: string | null; claim_value?: number | null; claim_unit?: string | null; claim_period?: string | null;
 }
 
 /**
@@ -681,8 +715,8 @@ export interface FactListOpts {
   excludePrivate?: boolean;
 }
 
-/** FactListOpts plus the entity the recall cursor reads (listFactsSince, listFactsKeyset) narrow to before LIMIT. */
-export type RecallFactReadOpts = FactListOpts & { entitySlug?: string };
+/** FactListOpts plus the entity (and the page the fact sits on) listFactsSince and listFactsKeyset narrow to before LIMIT. */
+export type RecallFactReadOpts = FactListOpts & { entitySlug?: string; sourceMarkdownSlug?: string };
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
 export interface FactsHealth {
@@ -760,6 +794,7 @@ export interface TrajectoryOpts {
 export interface TrajectoryPoint {
   fact_id: number;
   valid_from: Date;
+  valid_until: Date | null;
   metric: string | null;
   value: number | null;
   unit: string | null;
@@ -809,6 +844,8 @@ export interface BrainEngine {
    */
   reconnect(ctx?: { error?: unknown }): Promise<void>;
   initSchema(): Promise<void>;
+  /** GBRA-467: run `fn` under the cross-process schema migration lock; callers use schema-migration-lock.ts. */
+  holdSchemaMigrationLock?<T>(fn: (assertHeld: () => Promise<void>) => Promise<T>): Promise<T>;
   transaction<T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions): Promise<T>;
   /** Short control transaction on the existing direct route; honors nested transaction scope. */
   transactionDirect<T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions): Promise<T>;
@@ -908,6 +945,9 @@ export interface BrainEngine {
    * the sync loop falls back to per-slug `deletePage` to log unrecoverable
    * failures to `failedFiles`). `gbrain sync` calls this on EVERY run that
    * sees a deleted file — it is NOT admin-only.
+   *
+   * Unlike `deletePages` it scrubs nothing else: the page purge, its main
+   * caller, scrubs those stores itself and records them in its receipt.
    */
   deletePage(slug: string, opts?: { sourceId?: string }): Promise<void>;
   /**
@@ -928,7 +968,13 @@ export interface BrainEngine {
    * phases don't waste lookups on phantom slugs (paths that were in the
    * deletion list but had no DB row).
    *
-   * ATOMICITY: one statement, one transaction. The whole batch commits or
+   * #9068: in the same transaction, after the delete, it scrubs the rows
+   * that name a deleted page outside any foreign key: retrieval_event_pages,
+   * retrieval_event_links, retrieval_feedback, retrieval_weights,
+   * context_volunteer_events, mention_gazetteer_entries and the slug in
+   * eval_candidates.retrieved_slugs (scrubPurgedSlugs, scrubPurgedNameStores).
+   *
+   * ATOMICITY: one transaction. The whole batch commits or
    * the whole batch rolls back. Coarser than the per-row `deletePage`
    * cadence — a mid-loop abort or transient connection failure can roll
    * back up to `DELETE_BATCH_SIZE - 1` successful deletes from the
@@ -1017,7 +1063,7 @@ export interface BrainEngine {
    * cutoff arithmetic, same DB `now()` clock source) instead of the DELETE,
    * so the preview and a subsequent real run agree up to whatever crosses
    * the cutoff (or is soft-deleted/restored) between the two statements.
-   * Dry-run responses additionally carry `pages` (slug + deleted_at) for
+   * Dry-run responses additionally carry `pages` (slug, source_id, deleted_at) for
    * display; the destructive path leaves `pages` undefined.
    * `opts.excludeIds` keeps those page ids out of both (GBRA-130 A-49: the
    * tombstones the unmanaged belief-ledger expiry failed or parked).
@@ -1025,12 +1071,16 @@ export interface BrainEngine {
   purgeDeletedPages(
     olderThanHours: number,
     opts?: { dryRun?: boolean; excludeIds?: number[] },
-  ): Promise<{ slugs: string[]; count: number; pages?: { slug: string; deleted_at: Date }[] }>;
+  ): Promise<{ slugs: string[]; count: number; pages?: { slug: string; source_id: string; deleted_at: Date }[] }>;
   /**
    * v0.26.5: by default `listPages` excludes soft-deleted rows. Set
    * `filters.includeDeleted: true` to surface them.
    */
   listPages(filters?: PageFilters): Promise<Page[]>;
+  /** #7191: live pages whose slug, source path or title matches a find pattern (SQL in engine-sql/page-lookup.ts). */
+  findPages(query: FindPagesQuery): Promise<FoundPages>;
+  /** #7191: live page counts per (source, type), with distinct-slug totals per type group when `groupTypes` is set. */
+  countPagesBy(query: PageCountQuery, groupTypes?: TypeGrouper): Promise<PageCounts>;
   /**
    * Fuzzy slug resolver.
    *
@@ -1290,14 +1340,13 @@ export interface BrainEngine {
   /**
    * #4246: NULL out the embeddings (embedding + embedded_at +
    * embedded_text_hash) of every chunk whose stored `embedded_text_hash` no
-   * longer matches `md5(chunk_text)` — i.e. the chunk's text was rewritten
-   * after its vector was computed, so the vector describes a previous
-   * content revision. Feeds the NULL-embedding cursor exactly like
-   * invalidateStaleSignatureEmbeddings. GRANDFATHER: NULL hash (rows
-   * embedded before v133 stamped provenance) is never invalidated — no
-   * upgrade re-embed spike; the hash lands on each row's next re-embed.
-   * embed_skip pages are excluded (listStaleChunks can't re-embed them, so
-   * NULLing would strand them). Returns the chunk count invalidated.
+   * longer matches `md5(chunk_text)` (text rewritten after its vector was
+   * computed). Feeds the NULL-embedding cursor like
+   * invalidateStaleSignatureEmbeddings. GRANDFATHER: NULL hash (pre-v133
+   * rows) is never invalidated — no upgrade re-embed spike. embed_skip pages
+   * are excluded (listStaleChunks can't re-embed them). #7117: bounded
+   * batches in id order, one transaction each, no saved cursor (the embed
+   * paths run content-drift-sweep.ts). Returns the chunk count invalidated.
    */
   invalidateContentDriftEmbeddings(opts?: { sourceId?: string }): Promise<number>;
   /**
@@ -1364,7 +1413,7 @@ export interface BrainEngine {
   /** #6696 B3: counts per embedding state over the ACTIVE column (contract and ops/full semantics: src/core/embedding-state.ts). */
   readEmbeddingStateCounts(opts: { mode: 'ops' | 'full'; sourceIds?: string[]; purgeWindowHours: number }): Promise<EmbeddingStateCounts>;
   /** #6696 B3: one row per (page, state) in `states`, ordered (state, source_id, slug), at most `limit` rows. */
-  listEmbeddingStateRows(opts: { sourceIds?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number }): Promise<EmbeddingStateRow[]>;
+  listEmbeddingStateRows(opts: { sourceIds?: string[]; slugs?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number }): Promise<EmbeddingStateRow[]>;
   /**
    * Delete every chunk for a page. Internal page-id lookup is sourceId-scoped
    * when `opts.sourceId` is given; otherwise the bare-slug subquery returns
@@ -1386,7 +1435,7 @@ export interface BrainEngine {
    * `attendance` (#5761) excludes or selects pages whose attendance marker
    * equals their current knowledge revision.
    */
-  countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only' }): Promise<number>;
+  countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only'; wantedProducers?: readonly string[] }): Promise<number>;
   /**
    * List a keyset page (ordered by `id`, `id > afterPageId`) of stale pages
    * WITH their content so the caller extracts without an N+1 `getPage`. Same
@@ -1400,6 +1449,7 @@ export interface BrainEngine {
     sourceId?: string;
     versionTs?: string;
     held?: 'exclude';
+    wantedProducers?: readonly string[];
   }): Promise<StalePageRow[]>;
   /**
    * Stamp `links_extracted_at` for a batch of pages keyed on the unique
@@ -1780,7 +1830,7 @@ export interface BrainEngine {
   findOrphanPages(opts?: PageReadScope & {
     sourceId?: string;
     sourceIds?: string[];
-    mode?: 'inbound' | 'islanded';
+    mode?: 'inbound' | 'islanded'; scopeInbound?: boolean;
   }): Promise<Array<{
     slug: string;
     title: string;
@@ -2202,8 +2252,8 @@ export interface BrainEngine {
    * self-commits, so an insert throw would permanently lose the page's
    * facts.) `slug` / `excludeSourcePrefixes` / `preserveExpiredLegacy`
    * mirror `deleteFactsForPage`; the deleted count is returned as
-   * `deleted`. Callers that omit it get the standalone insert
-   * (deleted: 0), unchanged.
+   * `deleted`. Callers that omit it get the standalone insert (deleted: 0), unchanged.
+   * `opts.deleteForPageFirst` is deprecated (GBRA-161 PR 2, test/generations-deprecated-fact-writers.test.ts).
    */
   insertFacts(
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
@@ -2249,8 +2299,8 @@ export interface BrainEngine {
    * this does NOT promise: it protects the record, not the forget itself —
    * if the fence still carries the same claim, fence canonicality
    * independently reinserts it as a fresh active row (legacy DB-only
-   * forgets are documented as non-durable; see extract-facts.ts). Omitted
-   * ⇒ legacy behavior.
+   * forgets are documented as non-durable; see extract-facts.ts). Omitted ⇒ legacy behavior.
+   * @deprecated GBRA-161 PR 2: retire through publishFenceGeneration / publishExtractedFacts (docs/architecture/generations.md).
    */
   deleteFactsForPage(
     slug: string,
@@ -2261,6 +2311,7 @@ export interface BrainEngine {
   /**
    * Mark a fact expired. Never DELETE. Returns true iff a row was updated.
    * Idempotent-as-false (already expired returns false without changing state).
+   * @deprecated GBRA-161 PR 2: retire through publishFenceGeneration / publishExtractedFacts (docs/architecture/generations.md).
    */
   expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean>;
 
@@ -2337,13 +2388,13 @@ export interface BrainEngine {
    * embeddings; recency fallback otherwise. `arm: 'keyword'` ranks the same
    * bucket by full-text rank instead (C2 `facts.candidate_fusion`).
    * `attributedTo` (the new fact's speaker) drops rows a different known
-   * speaker asserted before the k cap, in every arm; NULL rows stay candidates.
+   * speaker asserted before the k cap, in every arm; NULL rows stay candidates; `excludeMemberPages` drops member pages.
    */
   findCandidateDuplicates(
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null; excludeMemberPages?: boolean; onlyPage?: string },
   ): Promise<FactRow[]>;
 
   /**
@@ -2396,6 +2447,13 @@ export interface BrainEngine {
   setBodyStagingState(id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null }): Promise<void>;
   /** Garbage collection: retired chunks and dead manifest rows (versions are roots), unreferenced texts past the grace window, expired stagings. */
   sweepSegments(opts?: SegmentSweepOptions): Promise<SegmentSweepResult>;
+  // Per-segment derivation watermarks (Wave B PR 4; types in page-body/derivations.ts, SQL in engine-sql/page-body.ts).
+  /** A page's rows (every kind, or `kind`; optionally only `occurrenceIds`), by kind then occurrence. */
+  readSegmentDerivations(pageId: number, opts?: { kind?: SegmentDerivationKind; occurrenceIds?: readonly number[] }): Promise<SegmentDerivationRow[]>;
+  /** Insert or replace rows keyed (page, kind, occurrence) in bounded statements; a replaced row keeps created_at. */
+  upsertSegmentDerivations(rows: readonly SegmentDerivationInput[]): Promise<void>;
+  /** Delete a page's rows (every kind, or `kind`) whose occurrence is not in `liveOccurrenceIds`; returns the count. */
+  retireSegmentDerivations(pageId: number, liveOccurrenceIds: readonly number[], opts?: { kind?: SegmentDerivationKind }): Promise<number>;
 
   // Versions
   /**
@@ -2403,8 +2461,8 @@ export interface BrainEngine {
    * without it the bare-slug lookup snapshots whichever row Postgres returns
    * first when the slug exists across multiple sources.
    */
-  /** `preimage` (#5984): the caller's own read of the page under its page guard in this transaction; versioned without a re-read. */
-  createVersion(slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot }): Promise<PageVersion>;
+  /** `preimage` (#5984): the caller's own read of the page under its page guard in this transaction; versioned without a re-read. `reason`/`historyGap` (GBRA-217, sync imports): the snapshot's change reason and the page's history-gap marker. */
+  createVersion(slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot } & import('./page-state/versions.ts').VersionHistory): Promise<PageVersion>;
   /**
    * v0.31.8 (D12 + D16): `opts.sourceId` source-scopes the page-id lookup.
    * When omitted, returns versions for every same-slug page across sources

@@ -1,4 +1,5 @@
 import { type ManagedSyncFailure } from '../core/persistence/sync-failures.ts';
+import { startMemoryTrace } from '../core/memory-trace.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { DEFAULT_PARALLEL_SOURCES } from '../core/sync-concurrency.ts';
 import { withHumanLogsToStderr, withSourcePrefix } from '../core/console-prefix.ts';
@@ -21,6 +22,8 @@ export interface SyncResult {
   managedWrite?: import('../core/persistence/sync-run.ts').ManagedSyncWriteDiagnostic;
   /** #6643: the request a rediscovery that retries a recorded failure waits for (its producer and slug), instead of a silent no-op. */
   retryWait?: import('../core/persistence/sync-run.ts').RetryWait;
+  /** #7167: a managed dry run's read of the source's writer: open write requests (queued, running or recovering) and the oldest one's age. */
+  writer?: import('../core/persistence/sync-dry-run-writer.ts').DryRunWriterState;
   /** #6712 PR 1: another drainer holds (or took) the source's drain lease; `resumable`, nothing admitted by this run. */
   leaseHeld?: import('../core/persistence/sync-lease.ts').DrainLeaseHeld;
   /**
@@ -28,11 +31,6 @@ export interface SyncResult {
    * not set them (`gbrain embed --stale` / `gbrain extract --stale` settle the pages they skipped).
    */
   inherited_options?: Array<'noEmbed' | 'noExtract' | 'noSchemaPack'>;
-  /** #6712 PR 1: this run finished a cursor another writer, or an older key, started, under that run's frozen options (shown to local callers). */
-  cursorAdopted?: { writer_changed: boolean; legacy_key: boolean; sync_options?: import('../core/persistence/sync-prepare.ts').SyncCursorOptions | null;
-    processing_options?: import('../core/persistence/sync-authority.ts').SyncProcessingOptions | null };
-  /** #6712 PR 1: older-key cursors of the incarnation this run's fan-in folded (`retained`: left while a request under them is open). */
-  cursorFanIn?: { adopted: boolean; superseded: number; retained: number };
   /** #6693: caller remembers refused while their page's file awaited import (or was held), replayed after this sync imported it. */
   replayedRemembers?: import('../core/repair/failed-writes.ts').ImportReplayReport;
   /** #6712 PR 2 (L4): live pages whose canonical file is gone (ghost pages), counted after a managed sync with the read-only repair preview; sync never deletes them. */
@@ -60,7 +58,7 @@ export interface SyncResult {
    * QUOTA — retry after fixing the provider) from genuine file poison
    * (--skip-failed territory).
    */
-  failureCodes?: Array<{ code: string; count: number }>;
+  failureCodes?: Array<{ code: string; count: number }>; /** GST-2492 PR 2: advice for a cause in the source's mode, not the files (`strict_requires_managed`). */ failureAdvice?: string;
   /**
    * Files skipped because their FILENAME contains bracket/control characters
    * (SyncableReason 'malformed-path'). Informational — these never gate
@@ -76,8 +74,14 @@ export interface SyncResult {
   fileRefusals?: import('../core/persistence/sync-discovery.ts').SyncFileRefusal[]; links?: import('../core/persistence/links-maintenance.ts').ManagedLinkExtraction; /** #6729: inexact renames split into delete + add; once recorded each is an IdentityDowngrade (old slug, what stayed on it). */ identityDowngrades?: Array<import('../core/sync.ts').DowngradedRename | import('../core/sync-identity-downgrades.ts').IdentityDowngrade>;
   /** #6712 PR 2 (L5): the owed post-checkpoint tail (statistics, links) this call ran after releasing the lease; a degraded tail carries its notice. */
   tail?: Omit<import('../core/persistence/sync-tail.ts').SyncTailReport, 'links'>;
+  /** GBRA-217: the pass's change-reason notices (a failed or capped trailer scan, a secret in a pushed trailer) and its count of skipped malformed trailers. */
+  reason_notices?: import('../core/agent-output.ts').Notice[];
+  /** GST-2462: the run's one `privacy_label_ignored` notice, counting by value the pages it wrote whose privacy label gbrain ignores. */
+  privacy_label_notice?: import('../core/agent-output.ts').Notice;
+  reason_trailers_malformed?: number;
   /** #5459 (P4.5): live pages a `--full` tree walk kept because their file is in the working tree and their import provenance is the working tree or unknown. */
   working_tree_kept?: number;
+  /** #8007: pages whose file is gone kept because gbrain.yml's storage section is invalid. */ storage_invalid_kept?: number;
   /**
    * Aggregated alias/undeclared explicit-type warnings (schema.type_warnings,
    * default on) — one entry per distinct non-canonical type this run.
@@ -97,6 +101,8 @@ export interface SyncResult {
   extract_error?: string;
   /** #5050: full sync re-sealed unchanged pages at the safe-chunk fence (see RunImportResult.resealed). */
   resealed?: import('./import.ts').RunImportResult['resealed'];
+  /** GBRA-287: DB-only pages (#2426) a full sync kept but could not re-export to the working tree; the run still completed. */
+  reexport_failures?: import('./sync/full.ts').ReexportFailure[];
   /**
    * v0.41.13.0 partial-sync fields (only set when status === 'partial').
    *
@@ -112,7 +118,10 @@ export interface SyncResult {
    * cron operators can disambiguate timeout vs pull-timeout in monitoring; connector item failures / early stop exit 1 (isFailedPartial).
    */
   filesImported?: number;
-  reason?: 'timeout' | 'pull_timeout' | 'pull_failed' | 'stall_timeout' | 'checkpoint_unavailable' | 'writer_pending' | 'writer_yield' | 'connector_item_failures' | 'connector_partial' | 'drain_lease_held';
+  reason?: 'timeout' | 'pull_timeout' | 'pull_failed' | 'stall_timeout' | 'checkpoint_unavailable' | 'writer_pending' | 'writer_yield' | 'connector_item_failures' | 'connector_partial' | 'drain_lease_held' | import('../core/persistence/sync-pass-row.ts').PassResultReason;
+  /** #6712 PR 4b: the live pass behind this result (`PassResultSummary`); `reconcile` is a remote caller's `reconcile_host_required` detail (design §5). */
+  pass?: import('../core/persistence/sync-pass-row.ts').PassResultSummary;
+  reconcile?: import('../core/persistence/sync-pass-apply.ts').RemoteReconcile;
   /**
    * v0.42.x (#1794): cumulative file paths durably banked to the checkpoint
    * across THIS run + prior resumed runs. Surfaced on every partial/blocked
@@ -133,13 +142,13 @@ export interface SyncResult {
   connectorHolds?: { held: number; newly_held: number; retry_command: string; status_command: string };
   /**
    * #5988 Git holds: files held this run instead of blocking (detail capped at
-   * `GBRAIN_SYNC_HOLD_CAP`), their count, the source's outstanding total and the
+   * `GBRAIN_SYNC_HOLD_CAP`), their count (#7199: how many wait on a person), the source's outstanding total and the
    * exact inspect and repair commands. Remote callers get `held_count` and
    * `holds_fix` (a host-operator relay) only.
    */
   held?: import('../core/persistence/sync-holds.ts').GitHoldItem[];
-  held_count?: number;
-  holds_outstanding?: number;
+  held_count?: number; held_needs_human?: number; carried?: import('../core/persistence/sync-holds.ts').CarriedHolds[]; skipped?: { symlink_dangling: { count: number; sample: string[] } };
+  holds_outstanding?: number; holds_released?: number;
   holds_escalated?: boolean;
   holds_truncated?: boolean;
   /** A sliced run (`writer_yield`) has not screened every entry yet. */
@@ -168,6 +177,8 @@ export {
 } from '../core/sync-cost-gate.ts';
 
 export interface SyncOpts {
+  /** #6712 PR 4b (design §7): the owner approved this sync's paid work (`--yes`); an unknown pass cost no longer defers it. */
+  costApproved?: boolean;
   repoPath?: string;
   dryRun?: boolean;
   full?: boolean;
@@ -199,6 +210,16 @@ export interface SyncOpts {
   capacityPreflight?: boolean;
   /** #6696: a runtime paid-work constraint (the cost gate deferred this run's embedding); never a processing option, never lifted by cursor adoption. */
   embedDeferred?: boolean;
+  /**
+   * G8 (persistence/git-conversion.ts): the conversion apply's strict-equivalent full pass, run before the source row says
+   * `canonical: git`. Internal: no CLI flag or MCP parameter sets it, it refuses a remote caller, and it cannot reach
+   * working-tree mode (resolveManagedSyncContext refuses `--working-tree` for a strict-classified pass).
+   */
+  canonicalOverride?: 'git';
+  /** #7866, internal (the conversion's strict passes): a full round without a `--full` episode, so a page equal to its blob is not re-imported. */
+  fullRound?: boolean;
+  /** PR A, internal (the conversion's strict passes): the Git verdicts over database versions the plan approved; any other is held (sync-pass.ts ConversionBinding). */
+  conversionBinding?: import('../core/persistence/sync-pass.ts').ConversionBinding;
   /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
@@ -362,7 +383,7 @@ export interface SyncOpts {
    * breadcrumbs already cover that surface).
    */
   onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number;
-    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } }) => void;
+    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number }; /** #7243: a pass round (`managed_sync.round_level`, `managed_sync.round_admit`; #7866 `managed_sync.round_batch`: `batch` of `batches`, starting at candidate `base`). */ round?: { round: number; target: string; paths: number; read_ms?: number; imports?: number; deletes?: number; in_flight?: number; batch?: number; batches?: number; base?: number } }) => void;
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the
    * cursor is done, the caller's signal/deadline stops it, or it is blocked
@@ -427,9 +448,8 @@ export async function runSync(engine: BrainEngine, args: string[]) {
   // serr/progress are stderr already. The envelope (sync/run.ts emitJson) and
   // `sync status|unblock --json` (sync/operator.ts) write through
   // writeJsonDocument, the guard's only stdout path.
-  return args.includes('--json')
-    ? withHumanLogsToStderr(() => runSyncInner(engine, args))
-    : runSyncInner(engine, args);
+  const stopTrace = startMemoryTrace('sync');
+  try { const out = await (args.includes('--json') ? withHumanLogsToStderr(() => runSyncInner(engine, args)) : runSyncInner(engine, args)); await (await import('./sources-add-next.ts')).noteSyncOutOfSearch(engine, args); return out; } finally { stopTrace(); }
 }
 
 /**

@@ -166,8 +166,10 @@ or a third of the remaining time. Pause both with
 
 The two new phases consolidate yesterday's conversations into long-term memory:
 
-**Synthesize phase (two-stage cascade):** reads transcripts from
-`dream.synthesize.session_corpus_dir`, then triages before it spends: a cheap
+**Synthesize phase (two-stage cascade):** reads the cycle source's transcripts from
+`dream.synthesize.session_corpus_dir` (another source's sessions wait for their own
+`gbrain dream --source <id> --phase synthesize`; unresolved or legacy files are held,
+already-extracted ones included, until `gbrain sweep --assign-corpus <source>`), then triages before it spends: a cheap
 utility-tier judge (`models.dream.triage`) scores every new file 0–1 for
 salience and pre-extracts candidate quotes + entities, cached in
 `dream_verdicts` with the judging model + prompt version (bounded per cycle
@@ -264,9 +266,13 @@ in `dream.synthesize.last_completion_ts` and is written only when every child
 completed and nothing was deferred (synthesis budget, triage time budget or
 publish pending), never on skipped or failed runs. So under a standing
 backlog the cooldown never applies and synthesize runs every cycle until the
-backlog drains (#6753); it is not a cap of ~2 runs a day. To cap spend, use
+backlog drains (#6753); it is not a cap of ~2 runs a day. The same setting
+also holds a growing transcript: one whose earlier version was synthesized
+within `dream.synthesize.cooldown_hours` is skipped as `resynthesis_cooldown`
+until that window passes, so it is re-synthesized at most about twice a day.
+To cap spend, use
 `dream.synthesize.max_submissions_per_source_per_day`. Explicit `--input` /
-`--date` / `--from` / `--to` invocations bypass cooldown.
+`--date` / `--from` / `--to` invocations bypass cooldown and the hold.
 
 **`--dry-run` semantics:** runs the scored triage pass (judges + caches
 verdicts for new files) but skips the synthesis subagents. NOT zero LLM
@@ -300,8 +306,12 @@ a colon (`Source: Summary`) is prose, so the row keeps `source: markdown` and th
 whole text as its summary.
 Note: extracted entries improve structured queries (`gbrain timeline`), not vector search.
 
-### Autopilot check
-Verify autopilot is running:
+### Upkeep and autopilot check
+`gbrain maintain --status` shows the last free-upkeep run, which an open
+`gbrain serve` does while idle; an item serve could not finish in 30 slices is
+listed as parked, and `gbrain maintain --unattended` finishes it. For a brain
+no agent opens most days, offer `gbrain maintain --schedule` (asks consent). On a Postgres brain with a repo,
+verify autopilot:
 ```bash
 gbrain autopilot --status
 ```
@@ -421,6 +431,13 @@ For a long run (>1000 chunks), route the approved command through the
 durable ladder in `skills/minion-orchestrator/SKILL.md` instead of a bare
 background shell, which hides that exit 3 in a log file.
 
+To see what search cannot reach on one source, run
+`gbrain pages unsearchable --source <id> --json` (read-only). Read
+`semantic_unsearchable`, not only `unsearchable`: it adds `keyword_only`
+pages, which keyword search finds but vector search misses. `awaiting_sync`
+counts files sync still holds, which no embedding state includes; follow
+`gbrain sync status --source <id> --json` for those. Each row carries its `fix`.
+
 ### Security (RLS verification)
 Run `gbrain doctor --json` and check the RLS status.
 All tables should show RLS enabled. If not, run `gbrain init` again.
@@ -468,9 +485,9 @@ your operational heartbeat.
 
 ### On every heartbeat (hourly or per-session)
 
-Run `gbrain doctor --json` and check for degradation. Report any failing checks
-to the user. Key signals: connection health, schema version, RLS status, embedding
-staleness.
+Run `gbrain doctor --alert --json`. Exit 0: report nothing. Exit 17: report each
+`alert.items` entry with its fix. Exit 18: report only when
+`alert.consecutive_unknown` is 2 or more. Never alert on `health_score`.
 
 ### Weekly maintenance
 

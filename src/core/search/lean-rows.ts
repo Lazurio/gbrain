@@ -16,7 +16,8 @@
  *   - safety and provenance markers whenever present: injection_suspected,
  *     injection_p, unverified, content_flag, status, superseded, superseded_by,
  *     message_id, thread_id, source_subject, matched_alias (the other name the
- *     alias fan-out searched); trust_tier and origin (#5575); `provenance`
+ *     alias fan-out searched); trust_tier and origin (#5575); quoted (a
+ *     fenced conversation excerpt, search/transcript-quote.ts); `provenance`
  *     only as `generated` (a machine-written page); modality when not text; stale
  *     only when set (true, or the held-file object from #5988);
  *   - `delivered: { truncated: true }` whenever evidence delivery truncated;
@@ -24,7 +25,9 @@
  *     reason }` (plus `truncated: true` when cut): `reason` is `long_page`
  *     when the page came back in that unit, `long_page_chunk` when it kept
  *     its ranked chunk;
- *   - `evidence_omitted` on a keyword-mode row whose text did not fit.
+ *   - `evidence_omitted` on a keyword-mode row whose text did not fit;
+ *   - `keyword_fill` on a row the keyless any-word fill appended (it holds
+ *     only some of the query's words).
  * `fields: "full"`, the `mcp.result_rows: full` host config and gbrain's own
  * thin client get every field; trusted local callers always do.
  */
@@ -40,8 +43,14 @@ const KEPT_FIELDS: ReadonlySet<string> = new Set([
   'message_id', 'thread_id', 'source_subject', 'relational', 'matched_alias', 'result_type', 'fact_id', 'page_slug', 'follow_up',
   // `match: "keyword"`: an enumerated page whose text did not fit the evidence budget.
   'evidence_omitted',
+  // GST-2762: a row the keyless any-word fill appended after the rows that hold every query word.
+  'keyword_fill',
   // #5575 A6: every row says how much it deserves influence.
   'trust_tier', 'origin', 'unconfirmed',
+  // #7600: a conversation page's row is a quoted excerpt.
+  'quoted',
+  // Result-time collapse and rank priors: folded pages, an unfollowed redirect, an image page's text row.
+  'collapsed', 'redirect_to', 'image_page',
   // Present only when the caller asked for `explain: true`.
   'score_details',
 ]);

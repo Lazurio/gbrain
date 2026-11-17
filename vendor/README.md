@@ -83,12 +83,83 @@ to share types in: GBrain passes one per database target, so every pool in a
 process that reaches one database shares it, and `src/core/pg-type-cache.ts`
 saves it for the next process.
 
+Stock postgres.js runs a `pg_type` query on every new connection before its
+first statement. The patch's `array_types` option takes a `{ rows }` object:
+the first connection that fetches the array types stores them there, and every
+later connection of any pool given the same object applies them without the
+round trip. GBrain passes one per database target, in-process only, since
+extension type OIDs belong to one database's catalog (#6930,
+`test/pathological/pg-round-trips-6930.test.ts`).
+
+A pool built not to pipeline (`max_pipeline: 0`, a transaction-mode pooler,
+#6543) still pipelines up to `transaction_pipeline` statements on a
+connection its owner holds (`sql.begin`, `sql.reserve`) while every statement
+in flight leaves the connection inside a transaction: the last ReadyForQuery
+said `T` or `E`, or an in-flight statement began one, and none since may end
+it (COMMIT, ROLLBACK other than ROLLBACK TO, END, ABORT, PREPARE TRANSACTION).
+The pooler pins one server connection from BEGIN until the transaction ends,
+and nothing is sent behind a statement that may end it, so another owner's
+statements never reach that server connection. Default 0 (stock behaviour);
+GBrain sets 100 on transaction-mode URLs (#6930,
+`test/e2e/pgbouncer-transaction-pipeline-6930.test.ts`).
+
+With `transaction_pipeline` in force, `sql.begin({ first }, fn)` sends the
+transaction's first statement behind BEGIN before BEGIN's answer when
+`first(text)` accepts its text; every later statement, and a first one the
+test refuses, waits for that answer as stock `begin` does. If BEGIN fails,
+the early statement has run in autocommit and the rest are rejected unsent,
+so the test must accept only a read or a transaction-local `set_config`.
+GBrain passes `isPersistenceDeclaration` (`src/core/persistence/protocol.ts`)
+from the persistence transactions that open with the protocol declaration
+(GBRA-156, same test file).
+
+`sql.begin({ early }, fn)` sends every statement `early(text)` accepts, in
+order, behind BEGIN before BEGIN's answer, on any pool that pipelines inside
+a transaction (a pipelining pool, or `transaction_pipeline` in force); the
+first statement it refuses, and every later one, waits for the answer. The
+same rule applies: if BEGIN fails the accepted statements have run in
+autocommit, so the test must accept only reads and transaction-local
+`set_config`. GBrain passes `isPipelinableSearchRead`
+(`src/core/postgres-engine/search-settings.ts`) from its search read
+transactions, so a scoped search read costs one round trip instead of two
+(GBRA-156, `test/e2e/pgbouncer-transaction-pipeline-6930.test.ts` and
+`test/e2e/search-read-pipeline-postgres.test.ts`).
+
+On a reserved connection (`sql.reserve`), where the pool does not pipeline,
+`reservedTransactions().begin({ first }, fn)`
+(`src/core/postgres-engine/reserved-transactions.ts`) makes the same
+exception outside the driver. It replaces each query's `handler` property,
+the function postgres.js calls when it executes a query, with one that waits
+for BEGIN's answer. That code lives in `src`, not in this patch set, so
+`update-postgres.sh --check` does not cover it: after a driver upgrade,
+check that `Query.handler` is still called on execute, and run
+`test/persistence-pipeline-first.test.ts`.
+
 Each statement's row count resets at its ReadyForQuery. Stock postgres.js
 resets it only at CommandComplete. A statement that streams rows and then fails
 never gets there: a runtime error after its first rows, or a cancel or timeout
 while it is still producing them. The next statement on that connection then
 stored its rows after that many empty slots, so a one-row read came back as
 `[empty, row]` (`test/e2e/postgres-driver-row-count-postgres.test.ts`).
+
+A statement whose result type changed heals every connection in the process,
+not only the one that failed. When another session adds, renames or drops a
+column of a table that a prepared `SELECT *` or `RETURNING *` reads, Postgres
+answers that statement's next run with SQLSTATE 0A000 "cached plan must not
+change result type" (routine `RevalidateCachedQuery`) on every connection
+that prepared it. Stock postgres.js forgets the statement only on the failing
+connection and runs it again, which cannot work inside a transaction the error
+already aborted, so each pooled connection failed once. With the patch the
+first such error starts a new process-wide plan generation, and each
+connection drops its prepared statements before it builds its next query (the
+server-side statements stay until the connection closes; new ones take new
+names). Only a statement the connection had cached starts a generation: a
+fresh statement that fails this way means a pooler (PgBouncer with
+`max_prepared_statements`) mapped it onto an older server-side statement,
+which preparing again cannot heal. A `prepare: false` pool keeps no prepared
+statements, so nothing changes there. GBrain's write retry loops treat the aborted transaction as
+transient (`isStalePlanError` in `src/core/retry-matcher.ts`;
+`test/stale-plan-heal.test.ts`).
 
 An idle connection keeps nothing from its last statement. Stock postgres.js
 left its receive buffer as an empty view over the last message it joined from
@@ -108,6 +179,12 @@ tarball, verify SHA-512, apply the checked-in patch to every published runtime
 export, verify the upstream license and compare every byte. Run without
 `--check` to regenerate `postgres/`. This does not read a brain or alter any
 installed service. No driver dependency installation is required after regeneration.
+`bun run verify` runs the check as `check:vendor-postgres`
+(`scripts/check-vendor-postgres.sh`), so a fix in one copy that is missing from
+the patch or the other copies fails CI. The two pinned downloads are retried
+(bounded, with backoff) and kept by content hash in `~/.cache/gbrain-vendor`
+(`GBRAIN_VENDOR_CACHE`; test.yml caches it), and each is hash-checked on use.
+Without network and cache it is a recorded skip locally and a failure under CI.
 
 For security updates, the GBrain release maintainer owns this dependency:
 review upstream security advisories and supported releases, update the exact

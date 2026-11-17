@@ -3,10 +3,11 @@
  * sync screen (`screenSyncImport`) would refuse is held instead of admitted:
  * the caller writes the hold and advances the cursor in one transaction. A
  * pinned Git blob over the sync read bound is held by its size before its
- * content is loaded. `sync_parser_regression` stops the run only when the
- * page's import provenance proves the exact bytes imported validated before
- * and the refusal is not one this release makes on purpose (an intended
- * refusal, such as #7018's alias bound, holds that page alone).
+ * content is loaded. A parser regression is a refusal of bytes the page's
+ * import provenance proves imported validated before that this release does
+ * not make on purpose (an intended refusal, such as #7018's alias bound, holds
+ * that page alone): it is held `parser_regression` by default, and stops the run
+ * with `sync_parser_regression` only under GBRAIN_SYNC_PARSER_REGRESSION=stop.
  * Dry runs screen every pending import read-only with batched Git reads.
  * #6188: the screen runs with `fences: 'coordinated'` (see `screenSyncImport`):
  * a fence Tier 1 rewrites losslessly is admitted (publication commits the
@@ -23,18 +24,21 @@ import type { FenceFix } from '../fence-repair/types.ts';
 import { parseMarkdown, RECOVERY_VERSION, type IntendedRefusal } from '../markdown.ts';
 import { fenceMessage, type FenceMessageLocation } from '../fence-repair/reasons.ts';
 import { completeFenceLocation, FENCE_VERSION, type ReceiptFenceLocation } from '../fence-repair/refusal.ts';
+import { QUOTE_SCREEN_VERSION } from '../fence-repair/quote-markers.ts';
 import { fenceFileLine } from '../fence-repair/hold-fix.ts';
 import { slugConflictHoldMessage } from '../import-file.ts';
 import { isImageFilePath, isMultimodalEnabled, resolveSlugForPath } from '../sync.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { VERSION } from '../../version.ts';
-import { sha256 } from './digest.ts';
+import { digest, sha256 } from './digest.ts';
 import { readPageBodyPolicy, type PageBodyPolicy } from '../page-body/limits.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 import { readPagePurgeTombstones } from './page-purge.ts';
 import { listTrustAllowRules } from '../trust/allow-rules.ts';
-import { readSyncContent, readSyncFile, syncGitPath, type SyncDiscovery, type SyncEntry } from './sync-discovery.ts';
-import { pinnedWindowBlock, readBlobBytes, readBlobContents, readPinnedBlob, readPinnedBytes, readPinnedContent, readTreeBlobs, SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
+import { readSyncContent, readSyncFile, syncGitPath, UNREADABLE_SYNC_FILE, type SyncDiscovery, type SyncEntry } from './sync-discovery.ts';
+import { pinnedWindowBlock, readBlobBytes, readBlobContents, readFilterDrivers, readPinnedBlob, readPinnedBytes, readPinnedContent, readTreeBlobs, SYNC_READ_BOUND, type MissingAttributes, type TreeBlob } from './sync-blobs.ts';
 import { screenSyncImport, type SyncImportScreenInput } from './sync-prepare.ts';
+import { committedContentOrMissing, filterOwnedRefusal, missingAttributesRefusal, nullBytesRefusal } from './sync-entry-fault.ts';
 import type { SyncProcessingOptions } from './sync-authority.ts';
 import { gitHoldItem, readSyncHoldPolicy, readSyncImportProvenance, type GitHoldCode, type GitHoldItem, type GitHoldRecord, type PreparationStallMeta, type SyncHoldPolicy } from './sync-holds.ts';
 import type { WriteRequest } from './model.ts';
@@ -78,20 +82,76 @@ export function pinnedBlob(cursor: PinnedCursor, path: string): TreeBlob | null 
   return readPinnedBlob(cursor.gitRoot, cursor.target, syncGitPath(cursor, path), upcomingGitPaths(cursor));
 }
 
+let filterDrivers: { key: string; drivers: Map<string, string | null | MissingAttributes> } | null = null;
+/**
+ * GST-2312 (#9024): the Git filter driver of one entry's path at the pinned commit (`readFilterDrivers`), or null; a
+ * company plan's at its approved revision. A miss reads it with up to 2,000 of the committed imports after it in one
+ * `check-attr`; answers are kept per Git root and commit. A path under a `.gitattributes` the repository lacks throws
+ * `git_object_missing` (`missingAttributesRefusal`), and that answer is dropped once used, so the next run reads again.
+ */
+export function pinnedFilterDriver(cursor: Pick<SyncDiscovery, 'root' | 'gitRoot' | 'target' | 'entries' | 'companyPlan' | 'sourceId'> & { index?: number }, path: string): string | null {
+  const revision = cursor.companyPlan?.revision, gitRoot = revision?.git_root ?? cursor.gitRoot, target = revision?.commit ?? cursor.target;
+  const real = revision ? null : { gitRoot: realpathSync.native(cursor.gitRoot), root: realpathSync.native(cursor.root) };
+  const gitPathOf = (next: string) => real ? relative(real.gitRoot, resolve(real.root, next)).split(sep).join('/') : revision!.scope ? `${revision!.scope}/${next}` : next;
+  const gitPath = gitPathOf(path), key = `${gitRoot}\0${target}`;
+  if (filterDrivers?.key !== key) filterDrivers = { key, drivers: new Map() };
+  const known = filterDrivers.drivers;
+  if (!known.has(gitPath)) {
+    const upcoming: string[] = [];
+    for (let at = cursor.index ?? 0; at < cursor.entries.length && upcoming.length < 2000; at++) {
+      const entry = cursor.entries[at]!, next = entry.action === 'import' && !entry.working ? gitPathOf(entry.path) : gitPath;
+      if (next !== gitPath && !known.has(next)) upcoming.push(next);
+    }
+    for (const [next, driver] of readFilterDrivers(gitRoot, target, [gitPath, ...upcoming])) known.set(next, driver);
+    if (!known.has(gitPath)) known.set(gitPath, null);
+  }
+  const driver = known.get(gitPath) ?? null;
+  if (typeof driver !== 'object' || driver === null) return driver;
+  known.delete(gitPath);
+  throw missingAttributesRefusal({ gitRoot, sourceId: cursor.sourceId }, path, driver);
+}
+
 /**
  * A `both` entry's recorded disk blob (`driftBaseline`), or null. When the page still holds what it imports (sync-run.ts
  * `sameContentAtOrigin`, `pageOnly`), the database changed only what an import keeps (tags, links), so the newer file
- * overwrites nothing the database alone holds and the entry imports.
+ * overwrites nothing the database alone holds and the entry imports. #7338: an `unknown` entry (a page with no import
+ * record, imported by an older gbrain) carries its file at the incarnation's baseline commit: a page that still holds that
+ * file changed only in Git, so the edit imports instead of being held `file_drift`.
  */
 export function driftBaselineContent(gitRoot: string, entry: Pick<SyncEntry, 'drift' | 'driftBaseline'>): string | null {
-  if (entry.drift !== 'both' || !entry.driftBaseline) return null;
+  if ((entry.drift !== 'both' && entry.drift !== 'unknown') || !entry.driftBaseline) return null;
   try { return readBlobContents(gitRoot, [{ oid: entry.driftBaseline, size: SYNC_READ_BOUND }]).get(entry.driftBaseline) ?? null; } catch { return null; }
+}
+
+/**
+ * GST-2568: whether the stored frontmatter differs from a file's only by keys gbrain itself wrote to the database: a copy of
+ * the reserved `type` key (older imports) and the grandfather's `validate: false` (#6429), each absent from the file. A
+ * page with any other difference (a protected key, a label) is not treated as unchanged since that file.
+ */
+export function onlyDerivedKeysAdded(content: string, stored: Record<string, unknown> | null | undefined): boolean {
+  const file = parseMarkdown(content, 'derived-keys.md').frontmatter;
+  const page = stored ?? {};
+  return [...new Set([...Object.keys(file), ...Object.keys(page)])].every(key => digest(file[key] ?? null) === digest(page[key] ?? null)
+    || !Object.hasOwn(file, key) && (key === 'type' || key === 'validate' && page[key] === false));
+}
+
+/** #7199: whether the page still holds what the entry's baseline or one of its earlier committed versions (`driftHistory`) imports, tried in order. */
+export async function pageHoldsDriftBaseline(gitRoot: string, entry: Pick<SyncEntry, 'drift' | 'driftBaseline' | 'driftHistory'>, same: (content: string | null) => Promise<boolean>): Promise<boolean> {
+  if (await same(driftBaselineContent(gitRoot, entry))) return true;
+  if (entry.drift !== 'unknown') return false;
+  for (const oid of entry.driftHistory ?? []) if (await same(driftBaselineContent(gitRoot, { drift: 'unknown', driftBaseline: oid }))) return true;
+  return false;
 }
 
 /** The frozen import content of one entry (`readSyncContent`); a committed entry's pinned blob is read with the entries after it. */
 export function pinnedContent(cursor: SyncDiscovery & { index: number }, entry: SyncEntry): string {
   const content = entry.working ? null : readPinnedContent(cursor.gitRoot, cursor.target, syncGitPath(cursor, entry.path), upcomingGitPaths(cursor));
-  return content ?? readSyncContent(cursor, entry);
+  if (content !== null) return content;
+  try { return readSyncContent(cursor, entry); } catch (error) {
+    // GBRA-133 S-33: a committed blob the repository lost reads from identical working-tree bytes, or is refused git_object_missing.
+    if (entry.working) throw error;
+    return committedContentOrMissing(cursor, entry, pinnedBlob(cursor, entry.path), error);
+  }
 }
 
 /**
@@ -138,7 +198,7 @@ function heldEntry(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'r
   return { path: entry.path, source_path: entry.sourcePath, slug, page_id: pageId, code: refusal.code, message: refusal.message,
     upstream_version: content === null ? null : sha256(content),
     meta: { ...(refusal.reason ? { reason: refusal.reason } : {}), ...(refusal.key ? { key: refusal.key } : {}), ...(line !== undefined ? { line } : {}),
-      recovery_version: RECOVERY_VERSION, ...(refusal.fence ? { fence: refusal.fence, fence_version: FENCE_VERSION } : {}),
+      recovery_version: RECOVERY_VERSION, ...(refusal.fence ? { fence: refusal.fence, fence_version: FENCE_VERSION, quote_version: QUOTE_SCREEN_VERSION } : {}),
       ...(blob ? { blob_oid: blob.oid } : {}), ...(entry.working ? { working: true } : {}),
       ...(entry.renameFrom ?? entry.renameHeld ? { rename_from: entry.renameFrom ?? entry.renameHeld } : {}) } };
 }
@@ -220,13 +280,34 @@ export function originConflictHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' 
 /** Wave B: the hold for a file its streamed preparation refused, by the receipt's content-refusal code and message. */
 export function streamedRefusalHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld'>, slug: string, pageId: number | null,
   done: Pick<WriteRequest, 'error_code' | 'error_message'>, blobOid: string | null | undefined): HeldEntry {
-  return heldEntry(entry, slug, pageId, { code: done.error_code as ContentRefusal['code'], message: done.error_message ?? 'The streamed import refused this file.' },
+  const held = heldEntry(entry, slug, pageId, { code: done.error_code as ContentRefusal['code'], message: done.error_message ?? 'The streamed import refused this file.' },
     null, blobOid ? { oid: blobOid } : null);
+  return held.code === 'file_too_large' ? { ...held, meta: { ...held.meta, streamed: { gbrain_version: VERSION } } } : held;
 }
 
 export function oversizeHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld'>, slug: string, pageId: number | null, size: number | null, blob: TreeBlob | null | undefined): HeldEntry {
   return heldEntry(entry, slug, pageId, { code: 'file_too_large',
     message: `File too large (${size ?? `over ${SYNC_READ_BOUND}`} bytes; the sync read bound is the ${SYNC_READ_BOUND}-byte (24 MiB) page ceiling). Pages up to the ceiling are chunked and searchable; leave this file out of the source (sync.exclude) or keep it outside the brain repo. See docs/guides/memory-boundaries.md#large-pages.` }, null, blob);
+}
+
+/** File-system errors that make one path unreadable while the rest of its source reads (GBRA-130 A-7). */
+const UNREADABLE_ERRNO = new Set(['EACCES', 'EPERM', 'ELOOP', 'EISDIR', 'ENOTDIR']);
+/** GBRA-130 A-7: whether `readSyncFile` refused one path as not a readable regular file inside its root (a per-file error). */
+export function isUnreadableSyncFile(error: unknown): boolean {
+  const errno = (error as NodeJS.ErrnoException | null)?.code;
+  return error instanceof OperationError && error.detail === UNREADABLE_SYNC_FILE || typeof errno === 'string' && UNREADABLE_ERRNO.has(errno);
+}
+/**
+ * GBRA-130 A-7: the hold of a file sync cannot read as a regular file inside its root (a symlink component, a non-regular
+ * file, a permission or loop error); null for any other error. Its content is never read or followed, and the root-level
+ * refusals (the root itself replaced or escaped) are not per-file and stay run-level.
+ */
+export function unreadableFileHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld'>, slug: string, pageId: number | null, error: unknown,
+  blob: () => TreeBlob | null | undefined): HeldEntry | null {
+  if (!isUnreadableSyncFile(error)) return null;
+  const why = error instanceof OperationError && error.detail === UNREADABLE_SYNC_FILE ? error.message : `it cannot be read (${(error as NodeJS.ErrnoException).code})`;
+  return heldEntry(entry, slug, pageId, { code: 'file_unreadable',
+    message: `Sync did not read ${entry.path}: ${why} Sync reads only regular files inside the source root and never follows a symlink. Make it a readable regular file there (or exclude it with sync.exclude) and commit, then run gbrain sources retry-held to re-test it.` }, null, blob());
 }
 
 const purgeTombstonesByRun = new WeakMap<SyncScreenRun, Promise<Map<string, string>>>();
@@ -254,7 +335,8 @@ function runWriteGateSource(engine: BrainEngine, run: SyncScreenRun, sourceId: s
 }
 
 export interface FrozenImportScreen {
-  cursor: Pick<SyncDiscovery, 'sourceId' | 'incarnation' | 'root'>;
+  /** Without its Git fields (a content repair's screen of checkout bytes), no filter driver is read. */
+  cursor: Pick<SyncDiscovery, 'sourceId' | 'incarnation' | 'root'> & Partial<Pick<SyncDiscovery, 'gitRoot' | 'target' | 'entries' | 'companyPlan'>> & { index?: number };
   entry: SyncEntry; slug: string; pageId: number | null; snapshot: Snapshot;
   /** null only for an over-size file, whose content is never read. */
   content: string | null; rawHash: string | null; lineEndingOnly: boolean;
@@ -265,6 +347,8 @@ export interface FrozenImportScreen {
   retryCommand: string;
   /** #6188 dry run: told the fixes when Tier 1 admits the file by rewriting a fence. */
   onNormalized?: (fixes: FenceFix[]) => void;
+  /** GBRA-133: the freeze's timer turn, taken after the filter driver's Git read so the screen that follows starts a stretch of its own. */
+  turn?: () => Promise<void>;
 }
 
 /**
@@ -274,9 +358,11 @@ export interface FrozenImportScreen {
  */
 export async function frozenImportScreenInput(engine: BrainEngine,
   input: Pick<FrozenImportScreen, 'cursor' | 'entry' | 'slug' | 'snapshot' | 'rawHash' | 'lineEndingOnly'> & { content: string }, run: SyncScreenRun): Promise<SyncImportScreenInput> {
-  const { entry, slug, snapshot } = input;
+  const { entry, slug } = input;
   const moved = entry.renameFrom && entry.renameFrom.slug !== slug ? entry.renameFrom : undefined;
-  const base = moved ? await engine.readPageSnapshot(moved.slug, { sourceId: input.cursor.sourceId, includeDeleted: true }) : snapshot;
+  // GBRA-287: a page stored in segments up to the single-string ceiling is compared read back whole, as its publication compares it.
+  const snapshot = await materializedSnapshot(engine, input.snapshot);
+  const base = moved ? await materializedSnapshot(engine, await engine.readPageSnapshot(moved.slug, { sourceId: input.cursor.sourceId, includeDeleted: true })) : snapshot;
   return { content: input.content, rawHash: input.rawHash, lineEndingOnly: input.lineEndingOnly, slug, sourcePath: entry.sourcePath, path: entry.path,
     root: input.cursor.root, snapshot, base, renamed: !!moved, activePack: run.activePack, sanity: run.sanity,
     purgedPages: await runPurgeTombstones(engine, run, input.cursor.sourceId), writeGateSource: await runWriteGateSource(engine, run, input.cursor.sourceId) };
@@ -289,9 +375,23 @@ export async function screenFrozenContent(screenInput: SyncImportScreenInput, ru
 }
 
 /**
+ * GST-1209: the screen the next sync gives a file imported over a page whose stored body cannot be read (the segmented-tiling
+ * repair's input): the run's schema pack, sanity settings, purge tombstones and write gate, the coordinated fence step and
+ * the private-visibility hold, against the page's snapshot unread. A hold policy of `fail` still screens.
+ */
+export async function unreadPageImportScreen(engine: BrainEngine, input: { sourceId: string; root: string; path: string; slug: string; content: string;
+  snapshot: SyncImportScreenInput['snapshot'] }): Promise<ImportScreenResult> {
+  const activePack = (await loadActivePackForEngine(engine, { remote: false, sourceId: input.sourceId }).catch(() => null))?.manifest;
+  const run: SyncScreenRun = { policy: await readSyncHoldPolicy(engine), sanity: await loadImportSanityConfig(engine), activePack, normalize: () => fencesNormalizeEnabled(engine) };
+  return screenFrozenContent({ content: input.content, rawHash: sha256(input.content), lineEndingOnly: false, slug: input.slug, sourcePath: input.path, path: input.path,
+    root: input.root, snapshot: input.snapshot, base: input.snapshot, renamed: false, activePack, sanity: run.sanity,
+    purgedPages: await readPagePurgeTombstones(engine, input.sourceId), writeGateSource: await runWriteGateSource(engine, run, input.sourceId) }, run);
+}
+
+/**
  * The hold a frozen import earns, or null to admit it. Throws
- * `sync_parser_regression` (policy `stop`) when gbrain would hold bytes the
- * page's provenance says a validating gbrain imported.
+ * `sync_parser_regression` (policy `stop`, opt-in) when gbrain would hold bytes
+ * the page's provenance says a validating gbrain imported.
  */
 export async function screenFrozenImport(engine: BrainEngine, input: FrozenImportScreen, run: SyncScreenRun): Promise<HeldEntry | null> {
   const { entry, slug, pageId, snapshot, content, blob } = input;
@@ -311,8 +411,18 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
     return { ...held, meta: { ...held.meta, legacy_slugs: entry.legacySlugs } };
   }
   if (content === null) return null;
+  // GST-2312 (#9024): a committed blob a Git filter owns is held alone; sync never runs the filter that would turn it into text.
+  const { gitRoot, target, entries } = input.cursor;
+  const filtered = filterOwnedRefusal(entry.path, content, entry.working || !gitRoot || !target || !entries ? null
+    : pinnedFilterDriver({ ...input.cursor, gitRoot, target, entries }, entry.path), input.cursor.sourceId, true);
+  if (filtered) return heldEntry(entry, slug, pageId, filtered, content, blob);
+  await input.turn?.();
+  // GBRA-133 S-39: text holding NUL cannot be stored or carried in the write intent; only this file is held. A slug conflict
+  // still names the hold (#6749): its message carries the path alone, and the slug-conflicts lane reports NULL_BYTES as still_invalid.
+  const nul = nullBytesRefusal(entry.path, content);
   // #6188: a fence Tier 1 rewrites is admitted (publication writes the normalized file back); with fences.normalize=false it is held.
   const screen = await screenFrozenContent(await frozenImportScreenInput(engine, { ...input, content }, run), run);
+  if (nul && !(screen.status === 'refused' && screen.refusal.code === 'frontmatter_slug_conflict')) return heldEntry(entry, slug, pageId, nul, content, blob);
   if (screen.status === 'importable' && screen.fences?.fixes.length) input.onNormalized?.(screen.fences.fixes);
   if (screen.status !== 'refused') return null;
   const refusal = screen.refusal;
@@ -327,10 +437,10 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
             + `imported these exact bytes. ${intended.fix} The rest of the source keeps syncing.` }, content, blob);
       }
       const why = `gbrain ${VERSION} refuses ${entry.path} (${refusal.reason ?? 'yaml_parse'}${refusal.line !== undefined ? `, line ${refusal.line}` : ''}), but gbrain ${provenance.gbrain_version} imported these exact bytes and validated them.`;
-      if (run.policy.parserRegression === 'hold') return heldEntry(entry, slug, pageId, { code: 'parser_regression', message: `${why} Held under GBRAIN_SYNC_PARSER_REGRESSION=hold.` }, content, blob);
+      if (run.policy.parserRegression === 'hold') return heldEntry(entry, slug, pageId, { code: 'parser_regression', message: `${why} Held; the rest of the source keeps syncing.` }, content, blob);
       throw opError('sync_parser_regression', `Sync stopped: ${why}`,
         `This is a gbrain bug. Report it with the gbrain version (${VERSION}), the file (${entry.path}) and the code (${refusal.code}${refusal.reason ? `/${refusal.reason}` : ''}). `
-          + `Upgrade, or set GBRAIN_SYNC_PARSER_REGRESSION=hold for the process that syncs (it holds such files and lets the rest sync meanwhile), and never pin a release older than 0.60.305.0; then run: ${input.retryCommand}.`,
+          + `Upgrade, or pin the last good version (${provenance.gbrain_version}), then run: ${input.retryCommand}. Sync stopped because GBRAIN_SYNC_PARSER_REGRESSION=stop is set for the process that syncs; without it (the default) such a file is held and the rest syncs.`,
         { fix: { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false,
           why: 'Collects the gbrain version and brain health to attach to the bug report; the sync checkpoint did not advance past this file.' } });
     }
@@ -343,12 +453,20 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
 /**
  * Dry run: screens every pending import entry read-only (batched Git reads)
  * and lists the holds a real run would record. Entries the screen cannot
- * judge are reported in `screen_skipped`, never as holds.
+ * judge are reported in `screen_skipped`, never as holds. #7087: the counts are the changes still to publish (a
+ * prescreened no-op and a fenced unowned deletion change nothing); they replace the cursor's committed counts.
  */
 export async function dryRunScreen(engine: BrainEngine, discovery: SyncDiscovery & { index?: number }, run: SyncScreenRun | null, retryCommand: string): Promise<{
-  dry_run: true; would_hold?: GitHoldItem[]; would_hold_count?: number; would_normalize?: Array<{ path: string; classes: string[] }>; would_normalize_count?: number;
+  dry_run: true; added: number; modified: number; deleted: number; renamed: number; would_hold?: GitHoldItem[]; would_hold_count?: number; would_normalize?: Array<{ path: string; classes: string[] }>; would_normalize_count?: number;
   screen_skipped?: Array<{ path: string; code: string }> }> {
-  if (!run || discovery.companyPlan) return { dry_run: true };
+  const planned = { added: 0, modified: 0, deleted: 0, renamed: 0 };
+  for (const entry of discovery.entries.slice(discovery.index ?? 0)) {
+    if (entry.action === 'delete') { if (!entry.unownedDeletion) planned.deleted++; }
+    else if (entry.renameFrom) planned.renamed++;
+    else if (entry.pageId == null) planned.added++;
+    else if (!entry.prescreened) planned.modified++;
+  }
+  if (!run || discovery.companyPlan) return { dry_run: true, ...planned };
   const entries = discovery.entries.slice(discovery.index ?? 0).filter(entry => entry.action === 'import' && entry.slug);
   const committed = entries.filter(entry => !entry.working);
   const blobs = readTreeBlobs(discovery.gitRoot, discovery.target, committed.map(entry => syncGitPath(discovery, entry.path)));
@@ -389,7 +507,7 @@ export async function dryRunScreen(engine: BrainEngine, discovery: SyncDiscovery
       skipped.push({ path: entry.path, code: error instanceof OperationError ? error.code : 'storage_error' });
     }
   }
-  return { dry_run: true, ...(held.length ? { would_hold: held.slice(0, run.policy.cap), would_hold_count: held.length } : {}),
+  return { dry_run: true, ...planned, ...(held.length ? { would_hold: held.slice(0, run.policy.cap), would_hold_count: held.length } : {}),
     ...(normalized.length ? { would_normalize: normalized.slice(0, run.policy.cap), would_normalize_count: normalized.length } : {}),
     ...(skipped.length ? { screen_skipped: skipped } : {}) };
 }

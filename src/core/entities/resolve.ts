@@ -30,8 +30,9 @@ import { slugifySegment } from '../sync.ts';
 const siblingCanonical: typeof import('../mentions/siblings.ts').siblingCanonical = async (...args) =>
   (await import('../mentions/siblings.ts')).siblingCanonical(...args);
 import { isMissingSchemaObject } from '../utils.ts';
-import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { privatePagesFilterForCaller, remoteReadFloorSql } from '../search/private-visibility.ts';
 import { rankingLinkSql } from '../link-ranking-policy.ts';
+import { isHoldingSlug } from '../facts-fence.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -166,7 +167,7 @@ const NAME_NOISE_TOKENS = new Set(['the', 'inc', 'llc', 'ltd', 'co', 'corp', 'co
 
 /** True for pages that name one real-world person, company, fund or organization. */
 export function isIdentityEntity(slug: string, type?: string | null): boolean {
-  return (type != null && IDENTITY_TYPES.has(type)) || IDENTITY_DIRS.some(dir => slug.startsWith(dir));
+  return !isHoldingSlug(slug) && ((type != null && IDENTITY_TYPES.has(type)) || IDENTITY_DIRS.some(dir => slug.startsWith(dir)));
 }
 
 const FACT_ENTITY_TYPES = new Set(['concept', 'project', 'deal']);
@@ -174,8 +175,8 @@ const FACT_ENTITY_DIRS = ['hosts/', 'projects/', 'concepts/', 'deals/'];
 
 /** Pages a fuzzy fact attribution may land on: entities, never meetings, notes or other documents. */
 export function isFactEntityPage(slug: string, type: string | null): boolean {
-  return isIdentityEntity(slug, type) || (type != null && FACT_ENTITY_TYPES.has(type))
-    || FACT_ENTITY_DIRS.some(dir => slug.startsWith(dir));
+  return !isHoldingSlug(slug) && (isIdentityEntity(slug, type) || (type != null && FACT_ENTITY_TYPES.has(type))
+    || FACT_ENTITY_DIRS.some(dir => slug.startsWith(dir)));
 }
 
 function nameTokens(value: string): string {
@@ -213,7 +214,7 @@ export function retiredPageSql(p: string): string {
     OR lower(COALESCE(${p}.frontmatter->>'status', '')) ~ '(^|[^a-z])(alias|redirect|redirected)([^a-z]|$)')`;
 }
 
-const MAX_RETIREMENT_HOPS = 5;
+export const MAX_RETIREMENT_HOPS = 5;
 
 /** A frontmatter redirect value as a slug: `[[people/x|X]]`, `people/x.md` and `/people/x` are `people/x`. */
 function redirectSlug(value: string): string | null {
@@ -357,6 +358,8 @@ function isBareName(raw: string): boolean {
 // analysis/runbook documents (`infra/hive-dependency-audit-…`), and any such
 // doc would trip the ambiguity gate and re-break bare-token resolution.
 const PREFIX_EXPANSION_DIRS = ['people', 'companies', 'hosts', 'projects'] as const;
+/** Directories a bare entity name resolves under (findExactBasenameCandidates); factEntitySlugs reads the same set. */
+export const BASENAME_DIRS = [...PREFIX_EXPANSION_DIRS, 'concepts'] as const;
 
 async function findExactBasenameCandidates(
   engine: BrainEngine,
@@ -371,7 +374,7 @@ async function findExactBasenameCandidates(
       `SELECT slug FROM pages
         WHERE source_id = $1 AND deleted_at IS NULL AND slug = ANY($2::text[])
         LIMIT 2`,
-      [source_id, [...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)],
+      [source_id, BASENAME_DIRS.map(dir => `${dir}/${token}`)],
     );
   } catch {
     return [];
@@ -478,17 +481,19 @@ export type StrictResolution =
  * same-name trigram arm. Never guesses from a bare-name prefix and never
  * falls back to a slugified name. With `excludePrivate`, private pages are
  * removed before uniqueness is counted, so an unreadable namesake can neither
- * be returned nor change the outcome for a remote caller.
+ * be returned nor change the outcome for a remote caller. `forCaller` reads with
+ * the caller's policy (a remote read); without it the plain privacy fragment
+ * applies, which a derived-visibility decision needs.
  */
 export async function resolveStrictEntityReference(
   engine: BrainEngine,
   source_id: string,
   raw: string,
-  opts: { sameName?: boolean; excludePrivate?: boolean } = {},
+  opts: { sameName?: boolean; excludePrivate?: boolean; forCaller?: boolean } = {},
 ): Promise<StrictResolution> {
   const trimmed = raw.trim();
   if (!trimmed) return { slug: null, miss: 'no_page' };
-  const privacy = opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+  const privacy = opts.excludePrivate ? `AND ${opts.forCaller ? privatePagesFilterForCaller('p') : remoteReadFloorSql('p')}` : '';
   const live = async (slugs: string[]) => slugs.length === 0 ? [] : engine.executeRaw<{ slug: string; type: string | null }>(
     `SELECT p.slug, p.type FROM pages p
       WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.slug = ANY($2::text[]) ${privacy}`,
@@ -519,7 +524,7 @@ export async function resolveStrictEntityReference(
   }
   const token = slugify(trimmed);
   if (!trimmed.includes('/') && token.includes('-')) {
-    const basename = await pick(await live([...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)), 'basename');
+    const basename = await pick(await live(BASENAME_DIRS.map(dir => `${dir}/${token}`)), 'basename');
     if (basename) return basename;
   }
   const orgVariant = await pick(await live(orgDirVariants(trimmed)), 'basename');
@@ -552,6 +557,45 @@ export async function resolveStrictEntityReference(
     if ((opts.excludePrivate ? await live(prefixed) : prefixed).length > 0) return { slug: null, miss: 'unverified' };
   }
   return { slug: null, miss: 'no_page' };
+}
+
+/**
+ * #7248: up to five readable live pages a reference could mean, sorted by
+ * slug, for a refusal to name: the entity-directory basenames, organization
+ * variants, alias hits and bare-name prefix expansions, else the nearest
+ * entity pages by title or slug similarity that share the reference's first
+ * name token. Never a slugified guess.
+ */
+export async function entityReferenceCandidates(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+  opts: { excludePrivate?: boolean; forCaller?: boolean } = {},
+): Promise<string[]> {
+  const trimmed = raw.trim();
+  const token = slugify(trimmed);
+  if (!token) return [];
+  const privacy = opts.excludePrivate ? `AND ${opts.forCaller ? privatePagesFilterForCaller('p') : remoteReadFloorSql('p')}` : '';
+  const aliases = await aliasHitSlugs(engine, source_id, trimmed).catch(() => [] as string[]);
+  const prefixed = (await findPrefixCandidates(engine, source_id, token)).map(c => c.slug);
+  const named = await engine.executeRaw<{ slug: string }>(
+    `SELECT p.slug FROM pages p
+      WHERE p.source_id = $1 AND p.deleted_at IS NULL AND NOT ${retiredPageSql('p')} AND p.slug = ANY($2::text[]) ${privacy}
+      ORDER BY p.slug LIMIT 5`,
+    [source_id, [...new Set([...BASENAME_DIRS.map(dir => `${dir}/${token}`), ...orgDirVariants(trimmed), ...aliases, ...prefixed])]],
+  );
+  if (named.length) return named.map(r => r.slug);
+  const near = await engine.executeRaw<{ slug: string; title: string; type: string | null }>(
+    `SELECT p.slug, p.title, p.type FROM pages p
+      WHERE p.source_id = $1 AND p.deleted_at IS NULL AND NOT ${retiredPageSql('p')} ${privacy}
+        AND (lower(p.title) % $2 OR p.slug ILIKE '%' || $3 || '%')
+      ORDER BY GREATEST(similarity(lower(p.title), $2), similarity(p.slug, $3)) DESC, p.slug ASC
+      LIMIT 20`,
+    [source_id, trimmed.toLowerCase(), token],
+  ).catch(err => { if (isMissingTrigramError(err)) return []; throw err; });
+  const lead = token.split('-')[0]!;
+  const sharesLead = (r: { slug: string; title: string }) => slugify(r.title).split('-')[0] === lead || (r.slug.split('/').pop() ?? '').split('-')[0] === lead;
+  return near.filter(r => isFactEntityPage(r.slug, r.type) && sharesLead(r)).slice(0, 5).map(r => r.slug).sort();
 }
 
 /**

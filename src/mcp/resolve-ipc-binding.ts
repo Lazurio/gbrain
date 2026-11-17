@@ -34,8 +34,11 @@ import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/c
 import { lexicalArmsEnabled } from '../core/context/reflex.ts';
 import { VOLUNTEER_MAX_PAGES_CAP } from '../core/context/volunteer.ts';
 import { assembleTurnContext, TURN_CONTEXT_DEFAULT_MAX_BYTES, type TurnContextResult } from '../core/context/turn-context.ts';
-import { attachBrief, briefEnabled, BRIEF_MAX_BYTES, recordBriefDelivered, turnBrief, TURN_BRIEF_CUTOFF_MS, withBriefDeadline } from '../core/context/proactive-brief.ts';
+import { attachBrief, briefEnabled, BRIEF_MAX_BYTES, recordBriefDelivered, turnBrief, TURN_BRIEF_CUTOFF_MS, withBriefDeadline, type BriefClock } from '../core/context/proactive-brief.ts';
+
+const turnBriefClock = (now = Date.now()): BriefClock => ({ now, stopAt: now + TURN_BRIEF_CUTOFF_MS });
 import { proactiveEligibility } from '../core/eligibility/registry.ts';
+import { readHotMemorySessionOnly } from '../core/facts/meta-hook.ts';
 import { makeContextPackIpcHandler } from './context-pack-handler.ts';
 import { logBriefDeliveryFireAndForget, logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
 import { persistenceSocketPathForConfig, startPersistenceIpcServer, type PersistenceIpcProvider, type PersistenceIpcBinding } from '../core/persistence/ipc.ts';
@@ -68,18 +71,18 @@ function defaultRebindDelayMs(): number {
  * Wave 5 D5 proactive brief (default off): the legacy block is assembled
  * first and stands on its own; when `context.proactive_brief` is on, the
  * brief runs in what is left of a request-start cutoff (its queries stop once
- * it passes), inside a byte reservation taken from the legacy block, and
+ * it passes; `clock` defaults to that cutoff from now), inside a byte reservation taken from the legacy block, and
  * leads the text. Off, this is the legacy assembly exactly. Always assembles
  * against the serve's OWN registered source [CX2-10].
  */
-export async function turnContextWithBrief(engine: BrainEngine, sourceId: string, req: TurnContextRequest): Promise<TurnContextResult> {
-  const clock = { now: Date.now(), stopAt: Date.now() + TURN_BRIEF_CUTOFF_MS };
+export async function turnContextWithBrief(engine: BrainEngine, sourceId: string, req: TurnContextRequest, clock: BriefClock = turnBriefClock()): Promise<TurnContextResult> {
   const briefOn = await briefEnabled(engine);
   const base = await assembleTurnContext(engine, {
     sourceId,
     window: req.window ?? [],
     priorContextText: req.priorContextText,
     sessionId: req.sessionId,
+    sessionOnly: await readHotMemorySessionOnly(engine),
     maxBytes: briefOn ? Math.max(1024, (req.maxBytes ?? TURN_CONTEXT_DEFAULT_MAX_BYTES) - BRIEF_MAX_BYTES - 2) : req.maxBytes,
     // Per-request config read: `gbrain serve` is long-running, and the
     // lexical-arms switch reverts a false-fire regression on the NEXT turn
@@ -141,6 +144,8 @@ export async function bindResolveIpcForServe(
   persistenceProvider?: PersistenceIpcProvider,
   opts: {
     rememberCallable?: boolean | (() => boolean);
+    /** #7599: a lean serve (a read-only stdio serve on Postgres, `readOnlyServeSkipsResidentDuties`) registers no delegated sync, nudge or sweep kind (clients get the polite refusal); PGLite keeps them. #7612: it binds only its read socket, never the source or legacy socket a read-write serve answers delegation on. */
+    lean?: boolean;
     /** Delay before each re-bind attempt of a socket this serve does not hold; tests inject a short one. */
     rebindDelayMs?: () => number;
   } = {},
@@ -150,8 +155,11 @@ export async function bindResolveIpcForServe(
     const cfg = loadConfig();
     // #5042: this serve's own source-keyed socket, plus the legacy URL-only
     // socket when it is free (older hooks and hooks naming no source).
-    const resolveSocket = resolveSocketPathForConfig(cfg, 'resolve', defaultSource);
-    const legacySocket = resolveSocketPathForConfig(cfg);
+    // #7612: a lean serve on Postgres binds its read socket alone, so it can
+    // never hold either delegation-capable socket ahead of a read-write serve.
+    const readSocket = opts.lean ? resolveSocketPathForConfig(cfg, 'read', defaultSource) : null;
+    const resolveSocket = readSocket ?? resolveSocketPathForConfig(cfg, 'resolve', defaultSource);
+    const legacySocket = readSocket ?? resolveSocketPathForConfig(cfg);
     if (!resolveSocket || !legacySocket) return NULL_BINDING;
 
     // #6573: a socket path the OS cannot bind (even after the per-user
@@ -189,8 +197,9 @@ export async function bindResolveIpcForServe(
     // catch would otherwise swallow the error and start NO listener).
     // Kill switch: GBRAIN_SERVE_SYNC_IPC=0 → the kinds are simply not
     // registered and clients get 'unsupported_kind' (the polite refusal).
-    let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort'> = {};
-    if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
+    const delegation = process.env.GBRAIN_SERVE_SYNC_IPC !== '0' && !opts.lean;
+    let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort' | 'sync_nudge'> = {};
+    if (delegation) {
       try {
         const runner = await import('../core/serve-sync-runner.ts');
         syncHandlers = {
@@ -202,6 +211,8 @@ export async function bindResolveIpcForServe(
             }),
           sync_status: (req) => runner.getDelegatedSyncStatus(req.jobId, typeof req.afterLine === 'number' ? req.afterLine : 0),
           sync_abort: (req) => runner.abortDelegatedSync(req.jobId),
+          // GBRA-133 PR 2a: a wanted marker recorded through this serve, acknowledged, and a nudge to its notifier.
+          sync_nudge: async (req) => (await import('../core/notifier/nudge.ts')).recordSyncNudge(engine, req),
         };
       } catch (e) {
         process.stderr.write(
@@ -213,7 +224,7 @@ export async function bindResolveIpcForServe(
     // try/catch so a runner failure never takes the other kinds down.
     // Shares the GBRAIN_SERVE_SYNC_IPC kill switch (one delegation family).
     let sweepHandlers: Pick<IpcHandlers, 'sweep_start' | 'sweep_status'> = {};
-    if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
+    if (delegation) {
       try {
         const sweepRunner = await import('../core/serve-sweep-runner.ts');
         sweepHandlers = {

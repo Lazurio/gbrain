@@ -54,6 +54,7 @@ import {
   readIpcSecret,
   readIpcSecretForConfig,
   requestSyncAbort,
+  requestSyncNudge,
   requestSyncStart,
   requestSyncStatus,
   resolveSocketPath,
@@ -62,7 +63,9 @@ import {
 } from '../core/context/resolve-ipc.ts';
 import {
   DELEGATED_SYNC_LANES_MAX,
+  SYNC_NUDGE_VERSION,
   type DelegatedSyncOptions,
+  type SyncNudgeResponse,
   type SyncStartRegistration,
   type SyncStatusResponse,
   type WireSyncResult,
@@ -72,6 +75,7 @@ import { SYNC_FLAGS, syncFlagsRouted, type SyncFlagSpec } from '../core/sync-fla
 import type { BrainEngine } from '../core/engine.ts';
 import type { ConsumerRow } from '../core/persistence/consumer-heartbeat.ts';
 import type { SyncOpts, SyncResult } from './sync.ts';
+import { VERSION } from '../version.ts';
 
 /** Poll cadence for sync_status while a delegated job runs. */
 const POLL_MS = 1000;
@@ -144,20 +148,22 @@ export function parseDelegatedSyncArgs(args: string[]): ParsedDelegatedArgs {
  * explicitly waived the bound (--no-hard-deadline) — the ONLY unbounded
  * encoding; an interactive TTY default (null from resolveSyncHardDeadline)
  * maps to the same 3600s the non-TTY default uses, so a job whose client
- * dies is always bounded.
+ * dies is always bounded. A single-source --timeout bounds the job itself,
+ * not the watchdog's later backstop.
  */
 export async function deriveDelegatedTimeoutSeconds(
   args: string[],
   opts: { isTty?: boolean; env?: Record<string, string | undefined> } = {},
 ): Promise<number> {
   if (args.includes('--no-hard-deadline')) return 0;
-  const { resolveSyncHardDeadline } = await import('../core/sync-reconcile.ts');
+  const { resolveSyncHardDeadline, HARD_DEADLINE_GRACE_SEC } = await import('../core/sync-reconcile.ts');
   const res = resolveSyncHardDeadline(args, {
     isTty: opts.isTty ?? Boolean(process.stdout.isTTY),
     env: opts.env ?? process.env,
   });
   if (!res) return 3600;
-  return Math.max(1, Math.round(res.deadlineMs / 1000));
+  const hard = Math.max(1, Math.round(res.deadlineMs / 1000));
+  return res.reason === 'flag:--timeout' ? hard - HARD_DEADLINE_GRACE_SEC : hard;
 }
 
 async function setVerdict(code: number): Promise<void> {
@@ -232,7 +238,7 @@ export async function maybeDelegateSyncToServe(dataDir: string, args: string[]):
     serr(
       `[sync] a live \`gbrain serve\` (PID ${holder.pid}) holds this PGLite brain's ` +
       `single-writer lock but exposes no sync IPC (older gbrain, \`serve --http\`, or ` +
-      `GBRAIN_SERVE_SYNC_IPC=0). ` + remediation(holder.pid, 'Restart that serve on this gbrain version.'),
+      `GBRAIN_SERVE_SYNC_IPC=0). ` + remediation(holder.pid, 'If that serve runs an older gbrain, restart it on this version.'),
     );
     await setVerdict(1);
     return true;
@@ -271,6 +277,21 @@ export async function maybeDelegateSyncToServe(dataDir: string, args: string[]):
     return true;
   }
   const startResp = start as Exclude<SyncStartIpcResult, typeof IPC_UNAVAILABLE | { degraded: string }>;
+  // GBRA-133 PR 2a: a serve already syncing records this request as a wanted marker (never for --dry-run, which stays
+  // read-only); its notifier runs it once the running sync ends, so the request is not dropped.
+  if (!startResp.ok && startResp.error === 'busy' && !options.dryRun) {
+    const nudged = await requestSyncNudge(sock, { secret, version: SYNC_NUDGE_VERSION, sourceId: sourceId ?? 'default', requestedBy: 'delegated_sync',
+      ...(options.full ? { intent: 'full' as const } : options.noPull ? { intent: 'freshness' as const } : {}) });
+    const ack = nudged === IPC_UNAVAILABLE || 'degraded' in (nudged as object) ? null : nudged as SyncNudgeResponse;
+    if (ack?.ok && ack.marker) {
+      const m = ack.marker;
+      serr(`[sync] the serve (PID ${holder.pid}) is already syncing (job ${startResp.jobId ?? '?'}); recorded this request as wanted (${m.intent}`
+        + `${m.wanted_head ? ` ${m.wanted_head.slice(0, 8)}` : ''}, generation ${m.generation}); ${ack.notifier ? 'its notifier runs it when that sync ends' : 'the next resident with a notifier runs it'}.`);
+      if (args.includes('--json')) await (await import('../core/cli-force-exit.ts')).writeStdoutFinal(JSON.stringify({ action: 'nudged', source_id: m.source_id, intent: m.intent, wanted_head: m.wanted_head, marker_generation: m.generation, running_job_id: startResp.jobId ?? null }) + '\n');
+      await setVerdict(0);
+      return true;
+    }
+  }
   if (!startResp.ok) {
     serr(`[sync] ${startRefusalText(startResp)} ${remediation(holder.pid, '')}`);
     await setVerdict(1);
@@ -493,7 +514,7 @@ export type ManagedDelegationOutcome =
  * #6543: only a forced rung (the serve cannot take the run) really runs a consumer beside the serve; on the others this
  * process admits its writes and, with persistence.single_consumer on, the serve's consumer publishes them.
  */
-const fallbackLine = (pid: number, cause: string, forced: boolean, fix = 'Restart that serve on this gbrain version to run the catch-up inside it.'): string => forced
+const ownConsumerLine = (pid: number, cause: string, forced: boolean, fix = 'Restart that serve on this gbrain version to run the catch-up inside it.'): string => forced
   ? `[sync] ${cause}; this run uses its own consumer beside the serve (PID ${pid}). ${fix}`
   : `[sync] ${cause}; this run does not delegate to the serve (PID ${pid}): it admits its own writes, and with persistence.single_consumer on the serve's consumer publishes them. ${fix}`;
 
@@ -512,9 +533,13 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   // waiter-only behind the serve it bypassed. A healthy serve beside a kill switch or an unsupported flag keeps consuming.
   const own = async (reason: Extract<ManagedDelegationOutcome, { kind: 'own_consumer' }>['reason'], line: string | null = null, force = false): Promise<ManagedDelegationOutcome> => {
     if (line) serr(line);
-    if (force) (await import('../core/persistence/consumer-election.ts')).forceOwnConsumer(reason);
+    // #7167: a dry run writes nothing, so it starts no consumer of its own.
+    if (force && !opts.dryRun) (await import('../core/persistence/consumer-election.ts')).forceOwnConsumer(reason);
     return { kind: 'own_consumer', reason, line };
   };
+  // #7167: a dry run that is not delegated previews in this process and writes nothing; it neither admits writes nor runs a consumer.
+  const fallbackLine = (pid: number, cause: string, forced: boolean, fix?: string): string => opts.dryRun
+    ? `[sync] ${cause}; this dry run previews in this process instead of the serve (PID ${pid}) and writes nothing.` : ownConsumerLine(pid, cause, forced, fix);
   // 0. Opt-outs bypass the ladder before anything is probed or classified.
   if (args.includes('--no-delegate') || env.GBRAIN_SYNC_NO_DELEGATE === '1') return own('opted_out', null, true);
   const { resolveBrainId } = await import('../core/brain-resolver.ts');
@@ -526,7 +551,9 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   const sourceId = opts.sourceId ?? 'default';
   // 1. Only a managed source has the two-consumer problem; classic sync keeps its own path.
   const { readManagedMode } = await import('../core/persistence/managed-mode.ts');
-  if (!await readManagedMode(engine)) return own('not_managed');
+  const dispatch = await import('../core/sync-dispatch-read.ts');
+  const routing = await dispatch.syncDispatchRow(engine, sourceId);
+  if (!(routing ? dispatch.dispatchManagedMode(routing) : await readManagedMode(engine))) return own('not_managed');
   // #6696 C2: a flag the managed source refuses never reaches the serve; the refusal names it before any probe or socket call.
   const { managedForbiddenFlag, managedSyncFlagRefusal } = await import('../core/persistence/managed-sync-flags.ts');
   const forbidden = managedForbiddenFlag(opts);
@@ -544,6 +571,7 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   }
   if (!owner) return own('no_owner');
   const pid = owner.pid;
+  const sameBuild = owner.version === VERSION;
   if (owner.kind !== 'serve') {
     return own('owner_not_serve', `[sync] the live write owner on this host is a ${owner.kind} process (PID ${pid}), which cannot host a delegated sync; this run uses its own consumer beside it.`);
   }
@@ -557,11 +585,13 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   }
   // 4. Socket + secret: the serve bound to this source, else the legacy URL-keyed socket.
   const { sock, secret } = deps.socket ? await deps.socket(sourceId)
-    : { sock: await hookResolveSocketForConfig(cfg, sourceId), secret: readIpcSecretForConfig(cfg) };
+    : { sock: await hookResolveSocketForConfig(cfg, sourceId, { delegation: true }), secret: readIpcSecretForConfig(cfg) };
   if (!sock || !existsSync(sock) || !secret) {
-    return own('no_socket', fallbackLine(pid, 'the running gbrain serve exposes no sync IPC socket (older gbrain, or GBRAIN_SERVE_SYNC_IPC=0 on the serve)', false));
+    return own('no_socket', fallbackLine(pid, 'the running gbrain serve exposes no sync IPC socket (older gbrain, or GBRAIN_SERVE_SYNC_IPC=0 on the serve)', false,
+      sameBuild ? `That serve already runs this gbrain version (v${VERSION}), so restarting it changes nothing here: unset GBRAIN_SERVE_SYNC_IPC=0 on the serve, or read its log for why its sync IPC did not start.` : undefined));
   }
   // 5. The hand-off: this CLI's durable writer registration (the one its own consumer would run under).
+  dispatch.endSyncDispatchRead();
   const { registerLocalWriter } = await import('../core/persistence/identity.ts');
   const local = await registerLocalWriter(engine, 'cli');
   const registration: SyncStartRegistration = { id: local.id, credential: local.credential, lane: 'cli' };
@@ -590,7 +620,8 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   let start = await requestSyncStart(sock, { secret, clientToken, options, registration });
   if (start === IPC_UNAVAILABLE && await ownerAlive()) start = await requestSyncStart(sock, { secret, clientToken, options, registration });
   if (start === IPC_UNAVAILABLE) {
-    return own('no_socket', fallbackLine(pid, 'the running gbrain serve is not answering its IPC socket', true), true);
+    return own('no_socket', fallbackLine(pid, 'the running gbrain serve is not answering its IPC socket', true,
+      sameBuild ? `That serve already runs this gbrain version (v${VERSION}); it may be wedged.` : undefined), true);
   }
   if ('degraded' in (start as object)) {
     return own('older_serve', fallbackLine(pid, 'the running gbrain serve predates serve-delegated managed sync', true), true);
@@ -623,4 +654,40 @@ function pick<T extends object, K extends keyof T>(source: T, keys: readonly K[]
   const out: Partial<Pick<T, K>> = {};
   for (const key of keys) if (source[key] !== undefined) out[key] = source[key];
   return out;
+}
+
+/**
+ * GBRA-133 PR 2a: `gbrain sync trigger` while a live serve holds the PGLite brain. The request is recorded as a wanted
+ * marker through the serve (sync_nudge, acknowledged) and its notifier starts the sync: action nudged, exit 0. A serve
+ * running without a notifier (GBRAIN_NOTIFIER=0) records it too; the outcome then carries resident: null and the
+ * no_resident notice with the fix. Returns false off PGLite or when no serve holds the brain (the engine path records
+ * the marker and queues the job).
+ * The owner-delegated sync paths in cli/main.ts skip `sync trigger`, which they would refuse as an unknown sync option.
+ */
+export async function maybeTriggerThroughServe(config: { engine?: string; database_path?: string; database_url?: string } | null, args: string[]): Promise<boolean> {
+  if (config?.engine !== 'pglite' || !config.database_path || config.database_url || args.includes('--help') || args.includes('-h')) return false;
+  const dataDir = config.database_path;
+  const sourceId = args.find((a, i) => args[i - 1] === '--source');
+  if (!sourceId) return false;
+  const holder = probeLivePgliteHolder(dataDir);
+  if (!holder || !holder.serve) return false;
+  const json = args.includes('--json');
+  const sock = resolveSocketPath(dataDir);
+  const secret = readIpcSecret(dataDir);
+  const refuse = async (why: string) => { serr(`[sync trigger] a live gbrain serve (PID ${holder.pid}) holds this PGLite brain and ${why} ` + remediation(holder.pid, '')); await setVerdict(1); return true; };
+  if (!existsSync(sock) || !secret) return refuse('exposes no sync IPC (older gbrain, serve --http, or GBRAIN_SERVE_SYNC_IPC=0).');
+  const r = await requestSyncNudge(sock, { secret, version: SYNC_NUDGE_VERSION, sourceId, requestedBy: 'sync_trigger' });
+  if (r === IPC_UNAVAILABLE) return refuse('is not answering its IPC socket.');
+  if ('degraded' in (r as object)) return refuse('predates sync_nudge; restart it on this gbrain version.');
+  const resp = r as SyncNudgeResponse;
+  if (!resp.ok || !resp.marker) {
+    if (resp.error === 'unknown_source') { serr(`Source "${sourceId}" not found. List with: gbrain sources list`); await setVerdict(1); return true; }
+    return refuse(`refused the request (${resp.error ?? 'unknown error'}).`);
+  }
+  const { printTriggerOutcome } = await import('./sync/trigger.ts');
+  const m = resp.marker;
+  printTriggerOutcome({ action: 'nudged', source_id: m.source_id, intent: m.intent, wanted_head: m.wanted_head, marker_generation: m.generation,
+    resident: resp.notifier ? { kind: resp.resident ?? 'serve', pid: holder.pid } : null }, json);
+  await setVerdict(0);
+  return true;
 }

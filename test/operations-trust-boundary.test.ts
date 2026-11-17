@@ -235,8 +235,10 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'entity_identity_unlink',
       'extraction_review',
       'file_list',
+      'file_register',
       'file_upload',
       'file_url',
+      'file_verify',
       'get_recent_transcripts',
       'get_skill_retention',
       'import_skill_proposal',
@@ -245,6 +247,9 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'purge_deleted_pages',
       'retain_skill_revision',
       'sources_inspect',
+      // GST-1943: the storage manifest's writers run from the trusted local CLI only.
+      'storage_register',
+      'storage_update',
       'sync_brain',
       // W9F item 8: the CLI delegates rebuild to a resident owner over IPC.
       'takes_rebuild',
@@ -574,7 +579,7 @@ describe('ops-module system-access containment — top-level fs/child_process im
     // one of the memory verbs from src/core/verbs.ts — nothing else.
     expect(opsFiles).toContain('files.ts');
     expect(opsFiles).toContain('jobs.ts');
-    expect(await contributedOps('files.ts')).toEqual(['file_list', 'file_upload', 'file_url']);
+    expect(await contributedOps('files.ts')).toEqual(['file_list', 'file_register', 'file_upload', 'file_url', 'file_verify']);
     expect(await contributedOps('jobs.ts')).toContain('submit_job');
 
     const attributed = new Set<string>(verbOperations.map(op => op.name));

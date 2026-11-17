@@ -1,5 +1,6 @@
 import type { BrainEngine } from '../engine.ts';
 import type { ParsedPage } from '../import-file.ts';
+import { factsAbsorbWriteKey } from '../facts/dead-absorb-retry.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { resolvePageWriteNotabilityFilter } from '../facts/notability-filter.ts';
@@ -13,6 +14,7 @@ import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
 import { derivedExtractionSkip } from './derived-extraction-gate.ts';
+import { isGuestWrite, skipsGuestNote } from '../guests/derived.ts';
 import { bodyUnread, isSegmentedPage } from '../page-body/page-shape.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
@@ -93,6 +95,7 @@ async function bodyAlreadyOffered(engine: BrainEngine, slug: string, page: Parse
 export async function prepareFactsBackstop(engine: BrainEngine, row: WriteRequest, page: ParsedPage, before: PageSnapshot | null = null): Promise<FactsBackstopStatus> {
   const confined = derivedExtractionSkip(row.authority);
   if (confined) return { skipped: confined };
+  if (skipsGuestNote('facts_backstop', await isGuestWrite(engine, row.source_id, row.intent))) return { skipped: 'guest_source' };
   if (!(await isFactsExtractionEnabled(engine))) return { skipped: 'extraction_disabled' };
   const eligible = isFactsBackstopEligible(row.slug, page);
   if (!eligible.ok) return { skipped: eligible.reason };
@@ -151,7 +154,7 @@ export async function dispatchFactsBackstopEffect(engine: BrainEngine, effect: P
       slug: effect.data.slug, sourceId: effect.source_id, source: 'mcp:put_page', sessionId: `put_page:${effect.data.slug}`, notabilityFilter,
       visibility: effect.data.visibility === 'world' ? 'world' : 'private',
       persistence_request_id: effect.request_id, page_id: effect.data.page_id, revision: effect.revision,
-    }, { queue: 'default', idempotency_key: `facts-absorb:write:${effect.request_id}`, max_attempts: 5, backoff_delay: 60_000 });
+    }, { queue: 'default', idempotency_key: factsAbsorbWriteKey(effect.request_id), max_attempts: 5, backoff_delay: 60_000 });
     await completeEffect(tx, effect, { facts: 'queued', job_id: job.id });
   });
 }

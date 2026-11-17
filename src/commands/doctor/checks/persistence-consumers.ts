@@ -23,16 +23,15 @@
  * installed service's restart command (else the pid) and a verify. A serve
  * that predates heartbeats has no row; `consumers_without_heartbeat` names it.
  */
-import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import type { Check } from '../../doctor.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
 import { listHostConsumers, RESIDENT_CONSUMER_KINDS, type ListedConsumer } from '../../../core/persistence/consumer-heartbeat.ts';
 import { compareWriterVersions } from '../../../core/persistence/writer-versions.ts';
-import { launchdPlistPath, SERVE_LAUNCHD_LABEL, SERVE_SYSTEMD_UNIT, systemdUnitPath } from '../../../core/serve-service.ts';
+import { serveServiceRestartArgv } from '../../../core/serve-service.ts';
 import { VERSION } from '../../../version.ts';
 import { consumerOverlap, hostIdentityMismatches, ownersWithoutHeartbeat, OVERLAP_MIN_AGE_MS } from '../../../core/persistence/consumer-diagnostics.ts';
-import { localHostIdentity } from '../../../core/persistence/identity.ts';
+import { isEmbeddedIdentityValue, localHostIdentity } from '../../../core/persistence/identity.ts';
 import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 
@@ -95,7 +94,7 @@ export async function hostIdentityMismatchCheck(engine: BrainEngine): Promise<Ch
     return { name: 'host_identity_mismatch', status: 'warn', details: { ...details, minted_under: me.minted_under ?? 'unknown' },
       message: `host_identity_mismatch: ${mismatches.length} managed worktree(s) on this filesystem belong to another host identity. `
         + `This process reads ${me.path} (host ${me.id}, ${minted(me.minted_under)}). `
-        + ordered.slice(0, 3).map(m => `The binding for ${m.source_ids.join(', ') || m.worktree_id} at ${m.local_path} is owned by host ${m.owner_host_id} (${m.owner_host.host_json_path}, ${minted(m.owner_host.minted_under)})`
+        + ordered.slice(0, 3).map(m => `The binding for ${m.source_ids.join(', ') || m.worktree_id} at ${m.local_path} is owned by host ${m.owner_host_id} (${isEmbeddedIdentityValue(m.owner_host.host_json_path) ? 'identity given at open by an embedding host, no host.json' : `${m.owner_host.host_json_path}, ${minted(m.owner_host.minted_under)}`})`
           + `${m.reason === 'same_machine_id' ? ', minted on this same machine' : ', and this process\'s identity was minted after that binding under a different home'}.`).join(' ')
         + `${mismatches.length > 3 ? ` (first 3 of ${mismatches.length} shown.)` : ''} `
         + 'Every write from this process on those sources reports owner_unavailable (host_mismatch) and their maintenance never runs. '
@@ -109,10 +108,8 @@ export async function hostIdentityMismatchCheck(engine: BrainEngine): Promise<Ch
 export interface ServiceHost { platform: string; home: string; uid: number }
 
 /** The restart for one consumer: the installed serve service's own command, else stopping that pid for its supervisor or operator to start again. */
-function restartArgv(row: ListedConsumer, service: ServiceHost): string[] {
-  if (row.kind === 'serve' && service.platform === 'darwin' && existsSync(launchdPlistPath(service.home))) return ['launchctl', 'kickstart', '-k', `gui/${service.uid}/${SERVE_LAUNCHD_LABEL}`];
-  if (row.kind === 'serve' && service.platform === 'linux' && existsSync(systemdUnitPath(service.home))) return ['systemctl', '--user', 'restart', SERVE_SYSTEMD_UNIT];
-  return ['kill', String(row.pid)];
+export function restartArgv(row: Pick<ListedConsumer, 'kind' | 'pid'>, service: ServiceHost): string[] {
+  return (row.kind === 'serve' ? serveServiceRestartArgv(service) : null) ?? ['kill', String(row.pid)];
 }
 
 export async function serveBuildDriftCheck(engine: BrainEngine, hostId: string,

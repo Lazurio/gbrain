@@ -15,6 +15,7 @@ import type { ExplicitReadBinding } from './ops/contract.ts';
 import { configReadiness } from './readiness.ts';
 import { affectsRecall, type DegradedStage } from './types.ts';
 import type { RerankFailedReason } from './search/rerank.ts';
+import type { RetrievalCoverage } from './search/retrieval-coverage.ts';
 import { localTranscriptsFix } from './transcripts.ts';
 
 // ── degraded recall (F3) ───────────────────────────────────────────────────
@@ -52,11 +53,12 @@ export const DEGRADED_STAGE_GUIDANCE: Readonly<Record<RecallStage, StageGuidance
   keyword_relaxed_carried: { why: 'keyword matching was relaxed to find anything at all', fix: null },
   safe_index_pending: { why: 'some pages in scope are still being safety-indexed for agent readers and are withheld until that finishes', fix: 'doctor' },
   vector_candidates_incomplete: { why: 'vector search hit its candidate limit or deadline, so some semantic matches can be missing', fix: null },
-  keyword_candidates_incomplete: { why: 'CJK keyword matching hit its deadline or its candidate cap on a large corpus, so some keyword matches can be missing; narrow the search with source_id (the CLI source-id flag), or ask the user to raise search.cjk_keyword_deadline_ms (milliseconds, default 3000)', fix: null },
-  projection_pending: { why: 'recently written pages are not in the search index yet', fix: 'doctor' },
+  keyword_candidates_incomplete: { why: 'keyword matching returned a bounded result on a large corpus (the CJK deadline or candidate cap, or common words ranked from a sample), or its identifier or slug-handle lookup failed (reason timeout or provider_error), so some keyword matches can be missing; add a rarer word or an exact phrase, narrow with source_id (the CLI source-id flag) or types, or for CJK text ask the user to raise search.cjk_keyword_deadline_ms (milliseconds, default 3000)', fix: null },
+  projection_pending: { why: 'some pages in scope are not in the search index yet: recently written pages are being indexed, and image pages wait for an operator (doctor\'s text_projection_readiness check names which)', fix: 'doctor' },
   projection_by_design: { why: 'some image pages in scope hold protected OCR content and stay out of the search index by design; nothing is pending', fix: null },
   projection_status_unknown: { why: 'whether recent writes are in the search index could not be checked', fix: 'doctor' },
   keyword_count_unavailable: { why: 'the keyword match count did not finish, so how many pages match the query is unknown', fix: null },
+  saved_facts_withheld: { why: 'saved facts could not be checked for third-party text to quote, so they were withheld; the page results are complete', fix: 'doctor' },
   deadline: { why: 'the pack hit its time limit and is partial', fix: null },
   server_budget: { why: 'the server ran out of time budget for this pack', fix: null },
   no_query_terms: { why: 'the question has no searchable words and semantic search did not run, so no saved fact could be ranked against it', fix: 'embeddings' },
@@ -122,13 +124,37 @@ function rerankFix(reason: RerankFailedReason, retry?: { op: string; args: Recor
 }
 
 /** #6495: `keyword_arm_failed` with reason `skipped_after_timeout` (postgres-engine/keyword-timeout-cache.ts). */
-const KEYWORD_SKIPPED_WHY = 'the keyword arm was skipped: this exact keyword search hit the keyword statement timeout (search.keyword_statement_timeout_ms) within the last search.keyword_timeout_negative_cache_seconds (default 600 seconds), so the brain did not wait for the timeout again; a narrower query (source_id, types, since or until) runs keyword search, and the skip ends by itself when the entry expires';
+const KEYWORD_SKIPPED_WHY = 'the keyword arm was skipped: this exact keyword search hit the keyword statement timeout (search.keyword_statement_timeout_ms) within the last search.keyword_timeout_negative_cache_seconds (default 600 seconds), so the brain did not wait for the timeout again; a narrower query (source_id, types, since or until) runs keyword search, and the skip ends by itself when a background re-run in the serve of the statement answers or the entry expires';
 const KEYWORD_PLAN_VERIFY = { argv: ['gbrain', 'doctor', '--only', 'keyword_plan', '--json'] };
 function keywordPlanFix(): Action {
   return {
     argv: KEYWORD_PLAN_VERIFY.argv, consent: [], actor: 'agent', requires_exclusive: false, verify: KEYWORD_PLAN_VERIFY,
     why: "Read-only: doctor's keyword_plan reports the keyword statement bound, how many keyword timeouts and skips this brain recorded, and whether broad terms can be ranked inside the bound; raising the bound or the cache TTL is the user's call.",
   };
+}
+
+const PROJECTION_READINESS_VERIFY = { argv: ['gbrain', 'doctor', '--only', 'text_projection_readiness', '--json'] };
+/** #7492: pending image pages wait for an operator, not for indexing; doctor's readiness check names the fix per class. */
+function projectionReadinessFix(): Action {
+  return {
+    argv: PROJECTION_READINESS_VERIFY.argv, consent: [], actor: 'agent', requires_exclusive: false, verify: PROJECTION_READINESS_VERIFY,
+    why: "Read-only: doctor's text_projection_readiness counts the pending pages by class and names each fix: `gbrain projections drain` (it asks first) seals sealable images, and a paid re-import (`gbrain embed --stale --images`) seals the rest. Running either is the user's call.",
+  };
+}
+
+/**
+ * #7492: the counted `projection_pending` why, worded by class. Text pages are being indexed and need no action;
+ * image pages in the `sealable` or `reimport` class never index on their own.
+ */
+function projectionPendingWhy(coverage: RetrievalCoverage, could: number, total: number): string {
+  const counted = `(${could} of ${total}${coverage.capped ? '+' : ''} pending page(s) could match this query)`;
+  const images = coverage.could_affect.pending_images ?? 0;
+  const rebuild = coverage.rebuild;
+  const rate = rebuild?.pages_per_second ? `, at about ${rebuild.pages_per_second < 10 ? rebuild.pages_per_second.toFixed(1) : Math.round(rebuild.pages_per_second)} page(s) per second measured since it started` : '';
+  const progress = rebuild ? `; the search index rebuild an upgrade started is ${rebuild.done} of ${rebuild.total} page(s) done${rate}, and \`gbrain doctor --only text_projection_readiness\` shows its progress` : '';
+  if (images === 0) return `${rebuild ? 'pages wait for that rebuild' : 'recently written pages are being indexed'} and are not in the search index yet ${counted}${progress}`;
+  const text = could - images;
+  return `${images} image page(s) that could match are not in the search index and will not be indexed on their own: sealable images wait for \`gbrain projections drain\` and the rest for a paid re-import (\`gbrain embed --stale --images\`), and doctor's text_projection_readiness check counts them by class${text > 0 ? `; ${text} recently written page(s) are being indexed` : ''} ${counted}${progress}`;
 }
 
 /** Doctor on the brain host; `run_doctor` where callable (renderAction drops it otherwise). */
@@ -155,14 +181,19 @@ function embeddingsFix(cfg: GBrainConfig | null | undefined, transport: 'stdio' 
  * A `rerank_failed` stage names its reason, the fallback (fused order) and, when the caller counts them
  * (`rerankDegradedCalls`), this session's reranker-degraded calls; its fix follows the reason (`retry`
  * is the call to repeat after a transient failure) when no other stage needs a fix.
+ * #7165: with the call's `coverage`, `projection_pending` is left out when no pending page could match the
+ * query, names how many could otherwise, and a notice whose only stage it is escalates (the same pending
+ * count shows once per session).
  */
 export function degradedRecallNotice(
   stages: ReadonlyArray<{ stage?: string; reason?: string } | string>,
-  opts: { config?: GBrainConfig | null; transport: 'stdio' | 'http' | 'cli'; optedOut?: boolean; rerankDegradedCalls?: number; retry?: { op: string; args: Record<string, unknown> } },
+  opts: { config?: GBrainConfig | null; transport: 'stdio' | 'http' | 'cli'; optedOut?: boolean; rerankDegradedCalls?: number; retry?: { op: string; args: Record<string, unknown> }; coverage?: RetrievalCoverage },
 ): Notice | null {
   const entries = stages.map(s => (typeof s === 'string' ? { stage: s } : s));
+  const pendingTotal = opts.coverage?.pending_projection, pendingCould = opts.coverage?.could_affect?.pending_projection;
+  const pendingCounted = typeof pendingTotal === 'number' && typeof pendingCould === 'number';
   const names = [...new Set(entries
-    .filter(s => affectsRecall(s) && (s.stage as string) in DEGRADED_STAGE_GUIDANCE)
+    .filter(s => affectsRecall(s) && (s.stage as string) in DEGRADED_STAGE_GUIDANCE && !(s.stage === 'projection_pending' && pendingCould === 0))
     .map(s => s.stage as RecallStage))];
   if (names.length === 0) return null;
   const pairs = [...new Set(entries.filter(s => names.includes(s.stage as RecallStage)).map(s => `${s.stage}:${s.reason ?? ''}`))].sort();
@@ -172,14 +203,17 @@ export function degradedRecallNotice(
   const labels = names.map(n => (n === 'rerank_failed' ? `rerank_failed: ${rerank}` : n === 'keyword_arm_failed' && keywordSkipped ? 'keyword_arm_failed: skipped_after_timeout' : n));
   const whys = names.map(n => (n === 'rerank_failed'
     ? `reranking failed because ${RERANK_REASON_WHY[rerank!]}, so results keep their fused order (fallback: fused_order${opts.rerankDegradedCalls ? `; reranker-degraded calls this session: ${opts.rerankDegradedCalls}` : ''})`
-    : n === 'keyword_arm_failed' && keywordSkipped ? KEYWORD_SKIPPED_WHY : DEGRADED_STAGE_GUIDANCE[n].why));
+    : n === 'keyword_arm_failed' && keywordSkipped ? KEYWORD_SKIPPED_WHY
+    : n === 'projection_pending' && pendingCounted ? projectionPendingWhy(opts.coverage!, pendingCould, pendingTotal)
+    : DEGRADED_STAGE_GUIDANCE[n].why));
   const guidance = names.map(n => DEGRADED_STAGE_GUIDANCE[n]);
   const fixKind: StageFix = guidance.some(g => g.fix === 'embeddings') ? 'embeddings' : guidance.some(g => g.fix === 'doctor') ? 'doctor' : null;
   const byChoice = opts.optedOut || entries.some(s => s.reason === 'embedding_disabled');
   const emb = fixKind === 'embeddings' ? (byChoice ? { byChoice: true } as { fix?: Action; byChoice: boolean } : embeddingsFix(opts.config, opts.transport)) : undefined;
   const onlyKeywordNeedsDoctor = keywordSkipped && names.every(n => n === 'keyword_arm_failed' || DEGRADED_STAGE_GUIDANCE[n].fix !== 'doctor');
+  const onlyImagesNeedDoctor = ((opts.coverage?.could_affect?.pending_images ?? 0) > 0 || opts.coverage?.rebuild !== undefined) && names.every(n => n === 'projection_pending' || DEGRADED_STAGE_GUIDANCE[n].fix !== 'doctor');
   const fix = emb ? emb.fix
-    : fixKind === 'doctor' ? (onlyKeywordNeedsDoctor ? keywordPlanFix() : doctorFix('Doctor names the failing retrieval dependency and its fix.'))
+    : fixKind === 'doctor' ? (onlyKeywordNeedsDoctor ? keywordPlanFix() : onlyImagesNeedDoctor ? projectionReadinessFix() : doctorFix('Doctor names the failing retrieval dependency and its fix.'))
     : rerank ? rerankFix(rerank, opts.retry) : undefined;
   const choice = emb?.byChoice ? ' This brain was set up keyword-only by the user\'s choice; mention it only if the user asks why something was not found. No query text was sent to an embedding provider. If the user wants semantic search, `gbrain doctor --json` names the enable command; turning it on needs their consent.' : '';
   return {
@@ -189,6 +223,7 @@ export function degradedRecallNotice(
     ...(fix ? { fix } : {}),
     ...(fix?.user_message ? { user_message: fix.user_message } : {}),
     ...(persistent ? { dedupe_key: pairs.join('|') } : {}),
+    ...(pendingCounted && names.every(n => n === 'projection_pending') ? { escalation: { key: 'projection_pending', level: pendingTotal } } : {}),
   };
 }
 
@@ -196,7 +231,7 @@ export function degradedRecallNotice(
 
 const BINDING_READ_OPS: ReadonlySet<string> = new Set(['search', 'query', 'recall', 'list_pages']);
 
-function emptyRead(op: string, result: unknown): boolean {
+export function emptyRead(op: string, result: unknown): boolean {
   if (Array.isArray(result)) return result.length === 0;
   if (op !== 'recall' || !result || typeof result !== 'object') return false;
   const r = result as { facts?: unknown[]; results?: unknown[] };
@@ -264,6 +299,30 @@ export function keylessThinkNotice(): Notice {
   };
 }
 
+/** GBRA-437: a remote think's `model` was not used; the host's think model answered instead. */
+export function modelOverrideIgnoredNotice(reason: 'not_allowed' | 'unusable'): Notice {
+  return {
+    code: 'model_override_ignored',
+    kind: 'info',
+    dedupe_key: reason,
+    why: reason === 'not_allowed'
+      ? 'This brain runs think on its own configured model for remote callers, so the requested model was not used; think ran on the host think model instead (modelUsed names it). Omit model, or ask the brain owner to allow it on the brain host.'
+      : 'The requested model is allowed for remote callers on this brain but cannot run there right now, so it was not used; think ran on the host think model instead (modelUsed names it).',
+    ...(reason === 'not_allowed' ? {
+      fix: {
+        argv: ['gbrain', 'config', 'set', 'think.remote_models', '<models>'],
+        consent: ['paid'],
+        actor: 'host_admin',
+        why: 'think.remote_models is a comma-separated list of models remote callers may pick for think; every think answer is a paid call on the host\'s key.',
+        user_message: 'This brain answers remote think calls with its own configured model. The owner can allow another model on the brain host with gbrain config set think.remote_models <models>.',
+        inputs: [{ name: 'models', how: 'The current think.remote_models value plus the requested model, comma-separated.' }],
+        verify: { argv: ['gbrain', 'config', 'get', 'think.remote_models'] },
+        requires_exclusive: false,
+      },
+    } : {}),
+  };
+}
+
 /** think with save/take over MCP: persistence is local-CLI only, so `saved_slug` is null. */
 export function thinkNotSavedNotice(): Notice {
   return {
@@ -291,6 +350,31 @@ export function privateFactNotice(factId?: string | number): Notice {
     code: 'private_fact_not_pushed',
     kind: 'info',
     why: `This fact is private: only local CLI recall reads it. Session hooks push world-visible facts only, so it will not reach a new agent session, and MCP agents cannot recall it. If the user wants their agents to know it without looking it up, ask them before saving it again with visibility world${forget}.`,
+  };
+}
+
+/**
+ * GST-2446: remember saved a fact for an entity that has no page, on a source whose pages are in Git. Once per entity
+ * per session. GST-2492: a fact held in Git (on memory/unattributed) needs nothing, so the notice only says where it is
+ * and when it moves; a fact in the database alone needs the user's word, so the step asks before creating the page.
+ */
+export function entityPageMissingNotice(sourceId: string, entitySlug: string, held?: { slug: string; committed: boolean }): Notice {
+  const base = { code: 'entity_page_missing', kind: 'info' as const, dedupe_key: `${sourceId}\0${entitySlug}` };
+  if (held) return { ...base,
+    why: `${held.committed ? 'Saved and committed to Git' : 'Saved in the database only, as its folder keeps its pages out of Git'}; held on ${held.slug} until ${entitySlug} has a page. Say that when you report the save. Nothing needs to run: once the page exists, the next maintenance cycle (gbrain dream) moves the fact into the page's Facts table${held.committed ? ', in its file' : ''}.` };
+  const userMessage = `The fact is saved in the database only: ${entitySlug} has no page, so it is in no file in Git. Should I create a page for ${entitySlug}?`;
+  return { ...base,
+    why: `Entity ${entitySlug} has no page in source ${sourceId}, so a fact saved for it is stored in the database only: recall returns it, but it is on no page and in no file in Git. Say that when you report the save, and ask the user whether to create the page; once it exists, the next maintenance cycle (gbrain dream) can move the facts saved for ${entitySlug} into the page's Facts table, in its file.`,
+    user_message: userMessage,
+    fix: {
+      ask_user: true,
+      argv: ['gbrain', 'put', entitySlug],
+      mcp: { tool: 'put_page', arguments: { slug: entitySlug, content: '<content>' } },
+      inputs: [{ name: 'content', how: `The page as Markdown: frontmatter with type and title, then what is known about ${entitySlug}. On the CLI, pass it on stdin.` }],
+      consent: [], actor: 'agent', requires_exclusive: false,
+      why: `Creates the page ${entitySlug}, so its facts have a file. Run it only after the user agrees.`,
+      verify: { argv: ['gbrain', 'get', entitySlug], mcp: { tool: 'get_page', arguments: { slug: entitySlug } } },
+    },
   };
 }
 
@@ -323,15 +407,16 @@ export function embeddingOptedOutFor(op: string, result: unknown, meta: Record<s
 /** Recall-affecting stages of one successful call, from its result and the handler-emitted `retrieval` meta. */
 export function recallStagesFor(op: string, result: unknown, meta: Record<string, unknown>, cfg?: GBrainConfig | null): string[] {
   const r = (result && typeof result === 'object' ? result : {}) as Record<string, unknown>;
-  if (op === 'search' || op === 'query') {
-    const retrieval = meta.retrieval as { degraded?: Array<{ stage?: string; reason?: string }> } | undefined;
-    return (retrieval?.degraded ?? []).filter(affectsRecall).map(d => d.stage as string);
-  }
+  const retrievalStages = ((meta.retrieval as { degraded?: Array<{ stage?: string; reason?: string }> } | undefined)?.degraded ?? [])
+    .filter(affectsRecall).map(d => d.stage as string);
+  if (op === 'search' || op === 'query' || op === 'find_experts') return retrievalStages;
   if (op === 'recall') {
     const facts = factsDegradedReason(r);
     return [...new Set([
       ...(typeof r.search_degraded === 'string' ? ['keyword_only_no_embedding_provider'] : []),
       ...(facts ? [facts === RECALL_KEYWORD_ONLY_OPTED_OUT ? 'keyword_only_no_embedding_provider' : facts] : []),
+      // GBRA-200: the page arm's own stages (an embed timeout, a failed arm, the keyword rank bound).
+      ...retrievalStages.filter(s => typeof r.search_degraded !== 'string' || s !== 'embed_unavailable'),
     ])];
   }
   if (op === 'context_pack') return typeof r.degraded_reason === 'string' ? [r.degraded_reason] : [];
@@ -357,7 +442,8 @@ export function recallInteropNotices(
     const entries = (meta.retrieval as { degraded?: Array<{ stage?: string; reason?: string }> } | undefined)?.degraded ?? [];
     const stages = recallStagesFor(op, result, meta, opts.config).map(stage => entries.find(d => d.stage === stage) ?? stage);
     const { _meta: _ignored, ...args } = params;
-    const degraded = degradedRecallNotice(stages, { ...opts, optedOut: embeddingOptedOutFor(op, result, meta), retry: { op, args } });
+    const coverage = (meta.retrieval as { coverage?: RetrievalCoverage } | undefined)?.coverage;
+    const degraded = degradedRecallNotice(stages, { ...opts, optedOut: embeddingOptedOutFor(op, result, meta), retry: { op, args }, coverage });
     if (degraded) out.push(degraded);
     const narrowed = opts.transport === 'stdio' ? sourceBindingNarrowedNotice(op, params, result, opts.binding) : null;
     if (narrowed) out.push(narrowed);

@@ -10,15 +10,19 @@
  * assemble_evidence unchanged with the key on, and the d5b/F4 instruction
  * config readers, all on the same engine.
  *
- * Runs when DATABASE_URL is set.
+ * Runs when DATABASE_URL is set, keyless as CI's Selected E2E runs it: run-e2e.sh keeps ambient provider keys, and
+ * with them every search calls a live reranker whose scores for identical calls differ in the last digits.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import type { SearchResult } from '../../src/core/types.ts';
+import { __setEmbedTransportForTests, configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 import { assembleEvidenceForHits } from '../../src/core/search/evidence-delivery.ts';
 import { buildMcpInstructions, readInstructionContent } from '../../src/mcp/instructions.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
+import { PROVIDER_ENV_KEYS } from '../helpers/provider-env.ts';
 import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 import { DECIDING, LONG_SLUG, MEDIUM_SLUG, mcpCall, opCall, seedLongPages, withConfig } from '../helpers/long-page-fixture.ts';
 
@@ -27,24 +31,53 @@ const KEY = 'search.long_page_unit';
 const run = process.env.DATABASE_URL ? describe : describe.skip;
 let engine: PostgresEngine;
 let close: () => Promise<void> = async () => {};
+const ambientProviderEnv = PROVIDER_ENV_KEYS.map(key => [key, process.env[key]] as const);
 
 beforeAll(async () => {
   if (!process.env.DATABASE_URL) return;
+  for (const key of PROVIDER_ENV_KEYS) delete process.env[key];
+  resetGateway();
   const isolated = await isolatedPersistencePostgres(process.env.DATABASE_URL);
   engine = isolated.engine;
   close = isolated.close;
   await seedLongPages(engine);
 }, 240_000);
-afterAll(async () => { await close(); }, 120_000);
+afterAll(async () => {
+  await close();
+  for (const [key, value] of ambientProviderEnv) if (value !== undefined) process.env[key] = value;
+  resetGateway();
+}, 120_000);
 
 const long = (rows: Array<Record<string, unknown>>) => rows.find(r => r.slug === LONG_SLUG)!;
 
+async function expectOffPathIsChunk(): Promise<Record<string, unknown>[]> {
+  const metas: Record<string, unknown>[] = [];
+  for (const [name, params] of [['search', { query: 'renewal fee' }], ['query', { query: 'renewal fee', expand: false }]] as const) {
+    await mcpCall(engine, name, params);
+    const chunk = await mcpCall(engine, name, { ...params, return_unit: 'chunk' });
+    expect((await mcpCall(engine, name, params)).bytes).toBe(chunk.bytes);
+    expect((await withConfig(engine, { [KEY]: 'off' }, () => mcpCall(engine, name, params))).bytes).toBe(chunk.bytes);
+    metas.push((JSON.parse(chunk.bytes) as { _meta: { retrieval: Record<string, unknown> } })._meta.retrieval);
+  }
+  return metas;
+}
+
 run('long-page delivery on Postgres', () => {
   test('off (unset or `off`) is byte-identical to return_unit chunk', async () => {
-    for (const [name, params] of [['search', { query: 'renewal fee' }], ['query', { query: 'renewal fee', expand: false }]] as const) {
-      const chunk = await mcpCall(engine, name, { ...params, return_unit: 'chunk' });
-      expect((await mcpCall(engine, name, params)).bytes).toBe(chunk.bytes);
-      expect((await withConfig(engine, { [KEY]: 'off' }, () => mcpCall(engine, name, params))).bytes).toBe(chunk.bytes);
+    await expectOffPathIsChunk();
+  });
+
+  test('off is byte-identical to return_unit chunk with an embedding provider configured, where only the first call of a query pays its embedding', async () => {
+    configureGateway({ embedding_model: LEGACY_EMBEDDING_CONFIG.embedding_model, embedding_dimensions: LEGACY_EMBEDDING_CONFIG.embedding_dimensions, env: { OPENAI_API_KEY: 'sk-fixture' } });
+    __setEmbedTransportForTests((async ({ values }: { values: string[] }) => ({
+      embeddings: values.map(() => Array.from({ length: LEGACY_EMBEDDING_CONFIG.embedding_dimensions }, () => 0.1)), values, usage: { tokens: 4 },
+    })) as never);
+    try {
+      const [, query] = await expectOffPathIsChunk();
+      expect(query.vector_enabled).toBe(true);
+    } finally {
+      __setEmbedTransportForTests(null);
+      resetGateway();
     }
   });
 

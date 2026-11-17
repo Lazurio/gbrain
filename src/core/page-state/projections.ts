@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { ProgressReporter } from '../progress.ts';
 import type { Chunk, ChunkInput, ResolvedColumn, PageKind } from '../types.ts';
@@ -16,6 +17,7 @@ import { getEmbeddingModel } from '../ai/gateway.ts';
 import { jsonRowBatches } from '../batch-rows.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
 import { belowSafeChunkFence, chunkGenerationFilter, movableChunkSql } from '../search/safe-chunks.ts';
+import { applyMoveWaves, CHUNK_VECTOR_WRITE_BUDGET, planMoveWaves, type ChunkMove } from './chunk-moves.ts';
 import { buildSegmentedProjection } from '../page-body/projection.ts';
 import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { pageReadFilter } from '../search/read-policy-sql.ts';
@@ -24,6 +26,9 @@ import { projectionClassSql, sealableImageSql } from './projection-class.ts';
 import { advanceProjectionCursor, ineligibleKey, rememberIneligible, residentWindowCtes, type ProjectionScanCursor } from './projection-window.ts';
 import { acceptedEmbeddingInputHashes, embeddingInputHash, plainEmbeddingTier, synopsisBodyHash,
   type EmbeddingInputContext, type EmbeddingTier } from '../embedding-input-hash.ts';
+import { chunkModelMatchesSql } from '../embedding-invalidation.ts';
+import { isRetryableConnError } from '../retry-matcher.ts';
+import { ACTIVATION_SERVED_REVISION } from '../search/safe-chunks.ts';
 
 /**
  * Complete the searchable snapshot only after its sanitized chunks are installed.
@@ -171,6 +176,159 @@ async function readGuardedProjectionSnapshot(tx: BrainEngine, slug: string, sour
     ...(fenceOverlay ? { fenceOverlay } : {}) };
 }
 
+/** #7172: the queue reason of a revision whose publication left its chunk replacement to `continueDeferredProjection`. */
+export const DEFERRED_CHUNK_REPLACEMENT = 'chunk_replacement_deferred';
+/** #7172: `<claim>:<token>`, the reason while a continuation holds the replacement (renewed each step, as a segmented projection claim is). */
+export const DEFERRED_CHUNK_CLAIM = 'chunk_replacement_continuing';
+
+/**
+ * Which stored rows a projection of `chunks` keeps (#5553, A4): each row holding a new chunk at its own index, and
+ * each other row whose chunk the projection holds at another index when its vector is current (`moves`, with the
+ * index and span each lands on). `current` lists the kept rows whose recorded embedding input the page accepts.
+ */
+async function planProjectionKeep(tx: BrainEngine, current: PageSnapshot, context: Awaited<ReturnType<typeof indexingContext>>, stored: Chunk[], chunks: ChunkInput[]) {
+  // #5553: keep a vector only when its recorded embedding input equals the
+  // input the current page would produce. A chunk with no record is kept
+  // only in the pre-contextual NULL mode; explicit none may have inherited
+  // an old title vector, so its missing proof cannot authorize retention.
+  // On a contextual page it is
+  // nulled once and stamped by its re-embed.
+  const mode = current.page.contextual_retrieval_mode;
+  const provenance = embeddingInputContext(context, current.page.title, context.corpusGeneration, chunks);
+  const col = quoteIdentifier(context.column.name);
+  const recorded = new Map((await tx.executeRaw<{ id: number; embedding_input_hash: string | null; movable: boolean }>(
+    `SELECT id,embedding_input_hash,${movableChunkSql(col)} AND ${chunkModelMatchesSql('model', '$2', `vector_dims(${col}) = ${context.column.dimensions}`)} AS movable FROM content_chunks WHERE page_id=$1`,
+    [current.page.id, context.provenanceModel])).map(row => [Number(row.id), row]));
+  const currentInput = (chunk: Chunk) => {
+    const hash = recorded.get(Number(chunk.id))?.embedding_input_hash ?? null;
+    return hash === null ? mode == null : acceptedEmbeddingInputHashes(provenance, mode, chunk).includes(hash);
+  };
+  // A4: a chunk unchanged at its index stays; one the new projection holds at
+  // another index stays too when its vector is current, and moves there, so a
+  // top insert re-embeds only the chunks whose text changed.
+  const identity = (chunk: ChunkInput | Chunk) => digest([chunk.chunk_text, chunk.chunk_source,
+    chunk.language ?? null, chunk.symbol_name ?? null, chunk.symbol_type ?? null,
+    chunk.start_line ?? null, chunk.end_line ?? null, chunk.parent_symbol_path ?? null,
+    chunk.doc_comment ?? null, chunk.symbol_name_qualified ?? null, chunk.modality ?? 'text']);
+  const atIndex = new Map(chunks.map(chunk => [chunk.chunk_index, identity(chunk)]));
+  const inPlace = stored.filter(chunk => atIndex.get(chunk.chunk_index) === identity(chunk));
+  const held = new Set(inPlace.map(chunk => chunk.chunk_index));
+  const open = new Map<string, ChunkInput[]>();
+  for (const chunk of chunks) if (!held.has(chunk.chunk_index)) open.set(identity(chunk), [...(open.get(identity(chunk)) ?? []), chunk]);
+  const moves: ChunkMove[] = [];
+  const moved = stored.filter(chunk => {
+    if (held.has(chunk.chunk_index) && atIndex.get(chunk.chunk_index) === identity(chunk)) return false;
+    if (!recorded.get(Number(chunk.id))?.movable || !currentInput(chunk)) return false;
+    const target = open.get(identity(chunk))?.shift();
+    if (!target) return false;
+    moves.push({ id: Number(chunk.id), from: chunk.chunk_index, to: target.chunk_index,
+      projected_byte_start: target.projected_byte_start ?? null, projected_byte_end: target.projected_byte_end ?? null });
+    return true;
+  });
+  const kept = [...inPlace, ...moved];
+  return { kept, moves, current: kept.filter(currentInput).map(chunk => Number(chunk.id)), provenanceModel: context.provenanceModel, column: context.column };
+}
+
+/** #7172: a deferred chunk replacement's remaining writes, planned once from what is stored and spent in steps. */
+interface DeferredReplacement {
+  current: PageSnapshot; pageId: number; column: ResolvedColumn; moves: ChunkMove[]; at: Map<number, number>; stale: number[]; inserts: ChunkInput[];
+  /** `chunkRowsFingerprint` after the plan's last committed step: a step that finds another one plans again. */
+  fingerprint: string;
+}
+
+/** The page's chunk rows as (id, index) pairs, hashed; no chunk text is read. */
+async function chunkRowsFingerprint(tx: BrainEngine, pageId: number): Promise<string> {
+  // chunk-visibility-ok: identity of a deferred replacement's rows (ids and indexes), never returned to a reader
+  const [row] = await tx.executeRaw<{ f: string }>(`SELECT count(*)::text||':'||COALESCE(sum(hashtext(id::text||':'||chunk_index::text)::bigint),0)::text AS f
+    FROM content_chunks WHERE page_id=$1`, [pageId]);
+  return row!.f;
+}
+
+/** Reads the page under its guard and plans its replacement; the rows it does not keep are deleted here (no index entry). */
+async function planDeferredReplacement(tx: BrainEngine, sourceId: string, slug: string): Promise<DeferredReplacement | null> {
+  const prepared = await readGuardedProjectionSnapshot(tx, slug, sourceId, { allowUnsealed: true });
+  if (!prepared || prepared.pageKind !== 'markdown' || prepared.snapshot.page.text_projection_revision === prepared.snapshot.revision) return null;
+  const current = prepared.snapshot;
+  const pageId = Number(current.page.id);
+  const { chunks } = await preparePageProjection(prepared);
+  const context = await indexingContext(tx, current, prepared.maxChunkTokensOverride);
+  const plan = await planProjectionKeep(tx, current, context, prepared.chunks, chunks);
+  await tx.executeRaw('DELETE FROM content_chunks WHERE page_id=$1 AND NOT(id=ANY($2::int[]))', [pageId, plan.kept.map(chunk => Number(chunk.id))]);
+  // chunk-visibility-ok: the kept rows of a deferred replacement whose vector the current page no longer accepts
+  const stale = (await tx.executeRaw<{ id: number }>(`SELECT id FROM content_chunks WHERE page_id=$1 AND ${quoteIdentifier(context.column.name)} IS NOT NULL
+    AND (NOT ${chunkModelMatchesSql('model', '$2', `vector_dims(${quoteIdentifier(context.column.name)}) = ${context.column.dimensions}`)} OR embedded_text_hash <> md5(chunk_text) OR NOT(id=ANY($3::int[]))) ORDER BY chunk_index`,
+  [pageId, plan.provenanceModel, plan.current])).map(row => Number(row.id));
+  const moved = new Set(plan.moves.map(move => move.id));
+  const occupied = new Set([...plan.kept.filter(row => !moved.has(Number(row.id))).map(row => row.chunk_index), ...plan.moves.map(move => move.to)]);
+  return { current, pageId, column: context.column, moves: plan.moves, at: new Map(plan.kept.map(chunk => [chunk.chunk_index, Number(chunk.id)])), stale,
+    inserts: chunks.filter(chunk => !occupied.has(chunk.chunk_index)), fingerprint: '' };
+}
+
+/**
+ * #7172: one bounded step of a chunk replacement a publication deferred (the page committed with its text projection
+ * pending, its search hiding the page's passages until the seal). Under the page guard, at the page's current
+ * revision, a step moves kept rows (each holds a vector) to their new indexes with at most `budget` vector-index
+ * writes (`planMoveWaves`); the step that finishes the moves clears the vectors whose input is no longer current,
+ * inserts the missing chunks without vectors (neither adds a vector-index entry) and seals the projection. The plan
+ * (`state`) is made once from what is stored and carried between steps only after a step commits; a step whose page
+ * revision or chunk rows differ from what the plan's last step left plans again, so a crash, a concurrent step or a
+ * newer write resumes from the stored rows. Each step renews the job's `updated_at`, the lease that keeps the
+ * resident's drain off a replacement being continued. 'skipped' when the page is not an unsealed inline Markdown page.
+ */
+export async function continueDeferredProjectionStep(engine: BrainEngine, sourceId: string, slug: string,
+  state: { plan?: DeferredReplacement; token?: string } = {}, budget = CHUNK_VECTOR_WRITE_BUDGET): Promise<'sealed' | 'more' | 'skipped' | 'held'> {
+  const claim = `${DEFERRED_CHUNK_CLAIM}:${state.token ??= randomUUID()}`;
+  const [step, next] = await engine.transaction(async (tx): Promise<['sealed' | 'more' | 'skipped' | 'held', DeferredReplacement?]> => {
+    await tx.lockPageKeys([{ sourceId, slug }]);
+    const [head] = await tx.executeRaw<{ id: number; revision: string; sealed: boolean }>(`SELECT id, knowledge_revision::text AS revision,
+      text_projection_revision IS NOT DISTINCT FROM knowledge_revision AS sealed FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL`, [sourceId, slug]);
+    if (!head || head.sealed) return ['skipped'];
+    const [held] = await tx.executeRaw(`SELECT 1 FROM page_projection_jobs j JOIN sources s ON s.incarnation=j.source_incarnation
+      WHERE s.id=$1 AND j.slug=$2 AND j.revision=$3::uuid AND split_part(j.reason,':',1)=$4 AND j.reason<>$5
+        AND j.updated_at>=now()-interval '${SEGMENTED_PROJECTION_LEASE_SECONDS} seconds'`, [sourceId, slug, head.revision, DEFERRED_CHUNK_CLAIM, claim]);
+    if (held) return ['held'];
+    const carried = state.plan?.current.revision === head.revision && state.plan.pageId === Number(head.id)
+      && state.plan.fingerprint === await chunkRowsFingerprint(tx, Number(head.id)) ? state.plan : null;
+    const base = carried ?? await planDeferredReplacement(tx, sourceId, slug);
+    if (!base) return ['skipped'];
+    const { current, pageId } = base;
+    const waves = planMoveWaves(base.moves, base.at, budget);
+    await applyMoveWaves(tx, pageId, waves.waves);
+    const job = [current.sourceIncarnation, slug, current.revision];
+    if (!waves.done) {
+      await tx.executeRaw('UPDATE page_projection_jobs SET reason=$4,updated_at=now() WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid', [...job, claim]);
+      return ['more', { ...base, moves: waves.pending, at: waves.at, fingerprint: await chunkRowsFingerprint(tx, pageId) }];
+    }
+    if (base.stale.length) {
+      await tx.executeRaw(`UPDATE content_chunks SET ${quoteIdentifier(base.column.name)}=NULL,embedded_at=NULL,embedded_text_hash=NULL,embedding_input_hash=NULL,
+        embedding_pending_since=COALESCE(embedding_pending_since,now()) WHERE page_id=$1 AND id=ANY($2::int[])`, [pageId, base.stale]);
+    }
+    if (base.inserts.length) await tx.upsertChunks(slug, base.inserts, { sourceId, embeddingColumn: base.column, sealChunkerVersion: MARKDOWN_CHUNKER_VERSION, pageId, deferSeal: true });
+    await sealImportedPage(tx, slug, sourceId, current, MARKDOWN_CHUNKER_VERSION, pageId);
+    await tx.executeRaw('DELETE FROM page_projection_jobs WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid', job);
+    return ['sealed'];
+  });
+  state.plan = next;
+  return step;
+}
+
+/**
+ * `continueDeferredProjectionStep` until the page is sealed, skipped, held by another continuation, or `until` says stop
+ * (a resident's time budget). A continuation that stops early or fails hands its claim back, so the drain resumes it at once.
+ */
+export async function continueDeferredProjection(engine: BrainEngine, sourceId: string, slug: string, until: () => boolean = () => false): Promise<'sealed' | 'more' | 'skipped' | 'held'> {
+  const state: { token?: string } = {};
+  const release = () => engine.executeRaw(`UPDATE page_projection_jobs SET reason=$1 WHERE slug=$2 AND reason=$3`,
+    [DEFERRED_CHUNK_REPLACEMENT, slug, `${DEFERRED_CHUNK_CLAIM}:${state.token}`]).catch(() => undefined);
+  try {
+    for (;;) {
+      const step = await continueDeferredProjectionStep(engine, sourceId, slug, state);
+      if (step !== 'more') return step;
+      if (until()) { await release(); return step; }
+    }
+  } catch (error) { await release(); throw error; }
+}
+
 /** No provider work under the guard. Delayed derived results lose to newer content. */
 export async function installPageProjection(engine: BrainEngine, prepared: ProjectionSnapshot, chunks: ChunkInput[], opts: { seal?: boolean; signature?: string; preserveEmbeddings?: boolean; code?: Awaited<ReturnType<typeof prepareCodeChunks>> } = {}): Promise<void> {
   const { snapshot } = prepared;
@@ -197,48 +355,14 @@ export async function installPageProjection(engine: BrainEngine, prepared: Proje
     ];
     if (changed.length) throw new PageProjectionConflictError(snapshot.revision, current!.revision, changed, slug, sourceId);
     if (opts.seal && opts.preserveEmbeddings) {
-      // #5553: keep a vector only when its recorded embedding input equals the
-      // input the current page would produce. A chunk with no record is kept
-      // only in the pre-contextual NULL mode; explicit none may have inherited
-      // an old title vector, so its missing proof cannot authorize retention.
-      // On a contextual page it is
-      // nulled once and stamped by its re-embed.
-      const mode = current!.page.contextual_retrieval_mode;
-      const provenance = embeddingInputContext(context, current!.page.title, context.corpusGeneration, chunks);
-      const col = quoteIdentifier(context.column.name);
-      const recorded = new Map((await tx.executeRaw<{ id: number; embedding_input_hash: string | null; movable: boolean }>(
-        `SELECT id,embedding_input_hash,${movableChunkSql(col)} AND model IS NOT DISTINCT FROM $2 AS movable FROM content_chunks WHERE page_id=$1`,
-        [snapshot.page.id, context.provenanceModel])).map(row => [Number(row.id), row]));
-      const currentInput = (chunk: Chunk) => {
-        const hash = recorded.get(Number(chunk.id))?.embedding_input_hash ?? null;
-        return hash === null ? mode == null : acceptedEmbeddingInputHashes(provenance, mode, chunk).includes(hash);
-      };
-      // A4: a chunk unchanged at its index stays; one the new projection holds at
-      // another index stays too when its vector is current, and upsertChunks moves
-      // the row there, so a top insert re-embeds only the chunks whose text changed.
-      const identity = (chunk: ChunkInput | Chunk) => digest([chunk.chunk_text, chunk.chunk_source,
-        chunk.language ?? null, chunk.symbol_name ?? null, chunk.symbol_type ?? null,
-        chunk.start_line ?? null, chunk.end_line ?? null, chunk.parent_symbol_path ?? null,
-        chunk.doc_comment ?? null, chunk.symbol_name_qualified ?? null, chunk.modality ?? 'text']);
-      const atIndex = new Map(chunks.map(chunk => [chunk.chunk_index, identity(chunk)]));
-      const elsewhere = new Map<string, number>();
-      for (const chunk of chunks) elsewhere.set(identity(chunk), (elsewhere.get(identity(chunk)) ?? 0) + 1);
-      const inPlace = stored.filter(chunk => atIndex.get(chunk.chunk_index) === identity(chunk));
-      for (const chunk of inPlace) elsewhere.set(identity(chunk), elsewhere.get(identity(chunk))! - 1);
-      const moved = stored.filter(chunk => {
-        const left = elsewhere.get(identity(chunk)) ?? 0;
-        if (atIndex.get(chunk.chunk_index) === identity(chunk) || left <= 0
-          || !recorded.get(Number(chunk.id))?.movable || !currentInput(chunk)) return false;
-        elsewhere.set(identity(chunk), left - 1);
-        return true;
-      });
-      const kept = [...inPlace, ...moved];
+      const { kept, current: currentIds, provenanceModel, column } = await planProjectionKeep(tx, current!, context, stored, chunks);
+      const col = quoteIdentifier(column.name);
       await tx.executeRaw(`DELETE FROM content_chunks WHERE page_id=$1 AND NOT(id=ANY($2::int[]))`, [snapshot.page.id, kept.map(chunk => chunk.id)]);
       await tx.executeRaw(`UPDATE content_chunks SET ${col}=NULL,
         embedded_at=NULL,embedded_text_hash=NULL,embedding_input_hash=NULL,
         embedding_pending_since=COALESCE(embedding_pending_since,now()) WHERE page_id=$1 AND
-        (model IS DISTINCT FROM $2 OR embedded_text_hash <> md5(chunk_text) OR NOT(id=ANY($3::int[])))`,
-      [snapshot.page.id, context.provenanceModel, kept.filter(currentInput).map(chunk => Number(chunk.id))]);
+        (NOT ${chunkModelMatchesSql('model', '$2', `vector_dims(${col}) = ${column.dimensions}`)} OR embedded_text_hash <> md5(chunk_text) OR NOT(id=ANY($3::int[])))`,
+      [snapshot.page.id, provenanceModel, currentIds]);
     } else if (opts.seal) await tx.deleteChunks(slug, { sourceId });
     await tx.upsertChunks(slug, chunks, { sourceId, expectedRevision: snapshot.revision, embeddingColumn: context.column });
     if (opts.code) await installCodeChunkEdges(tx, slug, sourceId, opts.code);
@@ -361,10 +485,12 @@ export async function queuePageProjection(engine: Pick<BrainEngine, 'executeRaw'
     ON CONFLICT(source_incarnation,slug) DO UPDATE SET revision=EXCLUDED.revision,reason=EXCLUDED.reason,updated_at=now()`, [sourceId, slug, reason]);
 }
 
+/** A live, unsegmented page's chunker version (`projectionBelowSafeFence`). */
+export const SAFE_FENCE_SQL = "SELECT chunker_version FROM pages WHERE id=$1 AND deleted_at IS NULL AND body_storage IS DISTINCT FROM 'segmented'";
+
 /** #5050/#5247: whether a live page's installed chunks predate the safe-chunk fence. */
 export async function projectionBelowSafeFence(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number): Promise<boolean> {
-  const [row] = await engine.executeRaw<{ chunker_version: number | null }>(
-    "SELECT chunker_version FROM pages WHERE id=$1 AND deleted_at IS NULL AND body_storage IS DISTINCT FROM 'segmented'", [pageId]) ?? [];
+  const [row] = await engine.executeRaw<{ chunker_version: number | null }>(SAFE_FENCE_SQL, [pageId]) ?? [];
   return row !== undefined && belowSafeChunkFence(row.chunker_version === null ? null : Number(row.chunker_version));
 }
 
@@ -474,7 +600,9 @@ export const SEGMENTED_PROJECTION_LEASE_SECONDS = 60;
  */
 export const SEGMENTED_PROJECTION_CLAIMED_SQL = `(split_part(j.reason,':',1)='${SEGMENTED_PROJECTION_CLAIM}' AND j.updated_at>=now()-interval '${SEGMENTED_PROJECTION_LEASE_SECONDS} seconds')`;
 export const PROJECTION_RETRY_READY_SQL = "(j.reason IS DISTINCT FROM 'rebuild_failed' OR j.updated_at<now()-interval '30 seconds')"
-  + ` AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`;
+  + ` AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`
+  // #7172: a chunk replacement a continuation holds renews its claim each step (continueDeferredProjectionStep), under the same lease.
+  + ` AND NOT (split_part(j.reason,':',1)='${DEFERRED_CHUNK_CLAIM}' AND j.updated_at>=now()-interval '${SEGMENTED_PROJECTION_LEASE_SECONDS} seconds')`;
 
 export interface ProjectionRebuildFailure { source_id: string; slug: string; reason: string }
 
@@ -519,6 +647,19 @@ export interface ProjectionRebuildOptions {
    * per run instead of once per batch. Ignored with `window`.
    */
   walk?: { after?: QueueKey };
+  /**
+   * #9192: pages rebuilt at once, each in its own transactions on its own pooled connection. Defaults to 1. When an
+   * extra connection is refused or dropped while more than one page is in flight, that page goes back to the others
+   * and one fewer page runs at once from then on (onNarrow); the last one keeps today's behaviour.
+   */
+  concurrency?: number;
+  /** Receives the lowered page count, and the connection error that lowered it. */
+  onNarrow?: (concurrency: number, error: unknown) => void;
+  /**
+   * #9192: only pages search does not answer for yet ('waiting'), or only pages it answers for from their
+   * pre-upgrade index (ACTIVATION_SERVED_REVISION, 'answering').
+   */
+  served?: 'waiting' | 'answering';
 }
 
 /** A queue row's position in the walk order (updated_at as text, so microseconds survive). */
@@ -628,7 +769,9 @@ export async function previewProjectionDrain(engine: Pick<BrainEngine, 'executeR
   const backlog = await projectionBacklog(engine);
   const rows = await engine.executeRaw<{ source_id: string; slug: string; page_kind: string; reason: string; updated_at: string }>(`SELECT s.id AS source_id,j.slug,p.page_kind,j.reason,j.updated_at::text AS updated_at
     FROM page_projection_jobs j ${projectionJobProbes({ media: true })}
-    ORDER BY j.updated_at,j.source_incarnation,j.slug LIMIT $1`, [Math.max(1, limit)]);
+    ORDER BY CASE WHEN p.page_kind NOT IN ('markdown','code') THEN 1
+      WHEN EXISTS (SELECT 1 FROM pages q WHERE q.source_id=s.id AND q.slug=j.slug AND q.text_projection_revision='${ACTIVATION_SERVED_REVISION}'::uuid) THEN 2
+      ELSE 0 END,j.updated_at,j.source_incarnation,j.slug LIMIT $1`, [Math.max(1, limit)]);
   return { ...backlog, rows };
 }
 
@@ -660,7 +803,13 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
     params.push(after.updated_at, after.source_incarnation, after.slug);
     filters.push(`(j.updated_at,j.source_incarnation,j.slug)>($${params.length - 2}::text::timestamptz,$${params.length - 1}::uuid,$${params.length})`);
   }
-  const sourceFilter = opts.pages ? `WHERE s.id=$${params.push(opts.pages.sourceId)}` : '';
+  const outer: string[] = [];
+  if (opts.pages) outer.push(`s.id=$${params.push(opts.pages.sourceId)}`);
+  if (opts.served) {
+    outer.push(`${opts.served === 'waiting' ? 'NOT ' : ''}EXISTS (SELECT 1 FROM pages q WHERE q.source_id=s.id AND q.slug=j.slug
+      AND q.text_projection_revision='${ACTIVATION_SERVED_REVISION}'::uuid)`);
+  }
+  const sourceFilter = outer.length ? `WHERE ${outer.join(' AND ')}` : '';
   const selected = opts.window ? await selectWindowJobs(engine, opts.window, opts.retryCooldown === true) : null;
   const jobs = selected ? selected.jobs.slice(0, Number(params[0])) : await engine.executeRaw<QueuedJob>(`SELECT s.id AS source_id,j.source_incarnation,j.slug,j.revision,p.page_kind,j.updated_at::text AS updated_at
     FROM (SELECT source_incarnation,slug,revision,updated_at FROM page_projection_jobs j
@@ -671,16 +820,22 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
   let rebuilt = 0;
   let superseded = 0;
   let attempted = 0;
-  for (const [index, job] of jobs.entries()) {
-    if (opts.deadlineMs !== undefined && index > 0 && now() - startedAt >= opts.deadlineMs) break;
-    attempted = index + 1;
+  const width = engine.kind === 'postgres' ? Math.max(1, Math.min(Math.floor(opts.concurrency ?? 1), jobs.length)) : 1;
+  let active = width;
+  let lost = 0;
+  let next = 0;
+  const retry: number[] = [];
+  // false: a refused or dropped connection handed this page back and this worker stops.
+  const runJob = async (index: number): Promise<boolean> => {
+    const job = jobs[index]!;
     const observed = [job.source_incarnation, job.slug, job.revision];
     try {
       const prepared = await engine.transaction(async tx => {
         await tx.lockPageKeys([{ sourceId: job.source_id, slug: job.slug }]);
-        const pending = await tx.executeRaw(`SELECT 1 FROM page_projection_jobs
+        const pending = await tx.executeRaw<{ reason: string }>(`SELECT reason FROM page_projection_jobs
           WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid`, observed);
         if (!pending.length) return null;
+        if (pending[0]!.reason === DEFERRED_CHUNK_REPLACEMENT || pending[0]!.reason.split(':')[0] === DEFERRED_CHUNK_CLAIM) return 'deferred';
         const read = await readGuardedProjectionSnapshot(tx, job.slug, job.source_id, { allowUnsealed: true });
         if (!read) {
           const [segmented] = await tx.executeRaw(`SELECT 1 FROM pages WHERE source_id=$1 AND slug=$2 AND body_storage='segmented' AND deleted_at IS NULL`,
@@ -697,8 +852,22 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
           WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid`, [...observed, snapshot.revision]);
         return read;
       });
-      if (!prepared) { superseded++; continue; }
-      if (prepared === 'removed') { superseded++; opts.onHeal?.({ kind: 'removed', source_id: job.source_id, slug: job.slug }); continue; }
+      if (!prepared) { superseded++; return true; }
+      if (prepared === 'removed') { superseded++; opts.onHeal?.({ kind: 'removed', source_id: job.source_id, slug: job.slug }); return true; }
+      if (prepared === 'deferred') {
+        // #7172: a publication left this revision's chunk replacement; it finishes in bounded steps, within the deadline.
+        const step = await continueDeferredProjection(engine, job.source_id, job.slug,
+          () => opts.deadlineMs !== undefined && now() - startedAt >= opts.deadlineMs);
+        if (step === 'sealed') rebuilt++;
+        else if (step === 'held') superseded++;
+        else {
+          superseded++;
+          // A skipped page (sealed meanwhile, or no longer inline Markdown) goes back to the ordinary rebuild.
+          await engine.executeRaw(`UPDATE page_projection_jobs SET updated_at=now()${step === 'skipped' ? ",reason='canonical_change'" : ''}
+            WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid`, observed);
+        }
+        return true;
+      }
       if (prepared === 'segmented') {
         const built = await buildSegmentedProjection(engine, { sourceId: job.source_id, slug: job.slug });
         await engine.executeRaw(built.sealed
@@ -707,28 +876,45 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
             AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`, observed);
         if (built.sealed) rebuilt++;
         else superseded++;
-        continue;
+        return true;
       }
       const projection = await preparePageProjection(prepared);
       await installPageProjection(engine, prepared, projection.chunks, { seal: true, preserveEmbeddings: true, code: projection.code });
       rebuilt++;
     } catch (error) {
+      if (active > 1 && isRetryableConnError(error)) {
+        active--;
+        lost++;
+        retry.push(index);
+        opts.onNarrow?.(width - lost, error);
+        return false;
+      }
       if (!(error instanceof PageRevisionConflictError)) {
         await engine.executeRaw(`UPDATE page_projection_jobs j SET reason='rebuild_failed',updated_at=now()
           WHERE j.source_incarnation=$1::uuid AND j.slug=$2 AND j.revision=$3::uuid AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`, observed);
         if (opts.onFailure) opts.onFailure({ source_id: job.source_id, slug: job.slug, reason: (error instanceof Error ? error.message : String(error)).split('\n')[0].slice(0, 300) });
         else process.stderr.write('[gbrain] Projection rebuild failed; work remains queued. Inspect projection readiness and the recorded source path.\n');
-        continue;
+        return true;
       }
       // The page moved under its install: defer the exact row this call listed
       // (a newer trigger-queued row already carries its own stamp) and report it.
       const deferred = await engine.executeRaw(`UPDATE page_projection_jobs SET updated_at=now()
         WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid RETURNING slug`, observed);
-      if (!deferred.length) { superseded++; continue; }
+      if (!deferred.length) { superseded++; return true; }
       opts.onHeal?.({ kind: 'deferred', source_id: job.source_id, slug: job.slug });
       opts.onFailure?.({ source_id: job.source_id, slug: job.slug, reason: `revision_conflict: ${error.message.split('\n')[0].slice(0, 280)}` });
     }
-  }
+    return true;
+  };
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = retry.length ? retry.shift()! : next < jobs.length ? next++ : -1;
+      if (index < 0 || (opts.deadlineMs !== undefined && index > 0 && now() - startedAt >= opts.deadlineMs)) { active--; return; }
+      attempted = Math.max(attempted, index + 1);
+      if (!(await runJob(index))) return;
+    }
+  };
+  await Promise.all(Array.from({ length: width }, worker));
   if (selected && opts.window) {
     // The window is finished up to its first eligible row this call did not reach.
     const unreached = selected.jobs.slice(attempted).find(job => job.ord > 0);
@@ -782,7 +968,8 @@ export interface ProjectionDrainResult {
  * after v153's activation) each of those statements scans pages, so 2,000
  * notes beside 93K queued images rebuilt at 14 pages/s instead of 150.
  */
-export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter; reasons?: readonly string[]; media?: boolean } = {}): Promise<ProjectionDrainResult> {
+export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter; reasons?: readonly string[]; media?: boolean;
+  concurrency?: number; onNarrow?: (concurrency: number, error: unknown) => void } = {}): Promise<ProjectionDrainResult> {
   const [{ runStart }] = await engine.executeRaw<{ runStart: string }>('SELECT now()::text AS "runStart"');
   // PGLite's clock can be coarse: wait until it passes the run start, so a page
   // that fails in this run is stamped after it and is not tried again.
@@ -800,7 +987,29 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
   let superseded = 0;
   let tried = 0;
   let seal = { sealed: 0, sealed_with_visual: 0, sealed_text_only: 0 };
-  const walk: { after?: QueueKey } = {};
+  let concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
+  const onNarrow = (width: number, error: unknown) => { concurrency = width; opts.onNarrow?.(width, error); };
+  // Continue while a batch rebuilt, removed, failed or durably deferred a
+  // row; stop on a no-op batch. A bare `superseded` row (another worker
+  // consumed it) is not progress, so one row can never spin the drain.
+  const rebuildInline = async (served: 'waiting' | 'answering') => {
+    const walk: { after?: QueueKey } = {};
+    while (opts.limit === undefined || tried < opts.limit) {
+      let healed = 0;
+      let failedNow = 0;
+      const batch = await rebuildPendingPageProjections(engine, Math.min(DRAIN_BATCH, (opts.limit ?? Infinity) - tried),
+        { notAfter: runStart, reasons: opts.reasons, media: opts.media, walk, served, concurrency, onNarrow, onHeal: () => { healed++; },
+          onFailure: failure => { failed.push(failure); if (!failure.reason.startsWith('revision_conflict:')) failedNow++; } });
+      rebuilt += batch.rebuilt;
+      superseded += batch.superseded;
+      const progressed = batch.rebuilt + healed + failedNow;
+      projectionDrainWork.batches++;
+      projectionDrainWork.inline_pages += progressed;
+      if (progressed === 0) break;
+      tried += progressed;
+      opts.progress?.tick(progressed, `${rebuilt} rebuilt, ${failed.length} failed`);
+    }
+  };
   try {
     // Wave B: pages stored in segments first, through their own route, each queued row listed once per run. A row
     // another process's live claim holds is not listed; one that row's build leaves unsealed stays queued.
@@ -817,24 +1026,9 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
       tried += batch.listed.length;
       opts.progress?.tick(batch.listed.length, `${rebuilt} rebuilt, ${failed.length} failed`);
     }
-    // Continue while a batch rebuilt, removed, failed or durably deferred a
-    // row; stop on a no-op batch. A bare `superseded` row (another worker
-    // consumed it) is not progress, so one row can never spin the drain.
-    while (opts.limit === undefined || tried < opts.limit) {
-      let healed = 0;
-      let failedNow = 0;
-      const batch = await rebuildPendingPageProjections(engine, Math.min(DRAIN_BATCH, (opts.limit ?? Infinity) - tried),
-        { notAfter: runStart, reasons: opts.reasons, media: opts.media, walk, onHeal: () => { healed++; },
-          onFailure: failure => { failed.push(failure); if (!failure.reason.startsWith('revision_conflict:')) failedNow++; } });
-      rebuilt += batch.rebuilt;
-      superseded += batch.superseded;
-      const progressed = batch.rebuilt + healed + failedNow;
-      projectionDrainWork.batches++;
-      projectionDrainWork.inline_pages += progressed;
-      if (progressed === 0) break;
-      tried += progressed;
-      opts.progress?.tick(progressed, `${rebuilt} rebuilt, ${failed.length} failed`);
-    }
+    // #9192: pages search does not answer for yet come first, then sealable images, then pages it answers for
+    // from their pre-upgrade index.
+    await rebuildInline('waiting');
     if (opts.media && (opts.limit === undefined || tried < opts.limit)) {
       const { sealImageProjections } = await import('./image-seal.ts');
       seal = await sealImageProjections(engine, { limit: opts.limit === undefined ? undefined : opts.limit - tried, notAfter: runStart });
@@ -843,6 +1037,7 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
       await noteProjectionRebuilds(engine, seal.sealed, async () => !(await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j ${probes}
         WHERE j.reason<>'rebuild_failed' LIMIT 1`)).length);
     }
+    await rebuildInline('answering');
   } finally {
     opts.progress?.finish();
   }

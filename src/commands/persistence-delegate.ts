@@ -9,7 +9,7 @@ import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
 import { RemoteMcpError } from '../core/remote-mcp-error.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { PENDING_WRITE_EXIT_CODE } from '../core/exit-codes.ts';
-import { acceptPendingRequested, pendingReceiptOf, pollCommand, WRITE_EXIT_DOCS, writeErrorExitCode } from '../core/persistence/write-wait.ts';
+import { acceptPendingCovers, acceptPendingRequested, pendingReceiptOf, pollCommand, WRITE_EXIT_DOCS, writeErrorExitCode } from '../core/persistence/write-wait.ts';
 import { cliRenderContext, toAgentError } from '../core/agent-output.ts';
 import { cliCommandOf } from '../cli/cli-error.ts';
 
@@ -45,6 +45,7 @@ export async function reportPersistenceCliError(error: unknown, json = false,
   if (pending) {
     console.error(`Poll: ${poll}`);
     if (!acceptPending) console.error(`Exit ${PENDING_WRITE_EXIT_CODE}: accepted, not yet committed. Wait longer with --wait <seconds>, or pass --accept-pending to exit 0 (${WRITE_EXIT_DOCS}).`);
+    else if (!acceptPendingCovers(pending)) console.error(`Exit ${PENDING_WRITE_EXIT_CODE}: accepted, but queued for an owner host that runs no consumer and has been quiet past the stale window (the receipt's diagnostic.owner); --accept-pending does not cover it. Run gbrain doctor --only owner_host_stale --json (${WRITE_EXIT_DOCS}).`);
   }
   setCliExitVerdict(writeErrorExitCode(error, acceptPending));
   return true;
@@ -55,12 +56,13 @@ export async function runDelegatedCliOperation(
   operation: string,
   params: Record<string, unknown>,
   config: GBrainConfig | null,
-  options: { brain?: string | null; timeoutMs?: number },
+  options: { brain?: string | null; timeoutMs?: number; room?: string },
   render: (operation: string, result: unknown, params: Record<string, unknown>) => string,
 ): Promise<boolean> {
   try {
     const delegated = await maybeDelegateLocalOperation(operation, params, config, options);
     if (!delegated.handled) return false;
+    if (options.room !== undefined) return await printDelegatedRoom(operation, delegated, options.room, params, render);
     const output = render(operation, delegated.result, params);
     if (output) await writeStdoutFinal(output);
     if ((delegated.result as { status?: unknown } | null)?.status === 'error') setCliExitVerdict(1);
@@ -69,6 +71,21 @@ export async function runDelegatedCliOperation(
     if (await reportPersistenceCliError(error, params.json === true)) return true;
     throw error;
   }
+}
+
+/** GBRA-498: a delegated answer for --room: the owner's marks (or every item unknown), the notices, then the room summary. */
+async function printDelegatedRoom(operation: string, delegated: { result: unknown; room?: { meta: unknown; notices: unknown[] } }, room: string,
+  params: Record<string, unknown>, render: (operation: string, result: unknown, params: Record<string, unknown>) => string): Promise<true> {
+  const roomCli = await import('../cli/room.ts');
+  const marked = await roomCli.delegatedRoom(operation, delegated, room);
+  const { applyCliOpNotices } = await import('../cli/op-notices.ts');
+  const { result, stderr } = applyCliOpNotices(roomCli.cliRoomResult(marked, params.json === true), params.json === true, { op: operation, retrieval: null });
+  const output = render(operation, result, params);
+  if (output) await writeStdoutFinal(output);
+  if (stderr) process.stderr.write(stderr);
+  if (params.json !== true) process.stderr.write(roomCli.roomSummaryLine(marked.meta));
+  if ((marked.result as { status?: unknown } | null)?.status === 'error') setCliExitVerdict(1);
+  return true;
 }
 
 export async function runDeferredPersistenceCommand(

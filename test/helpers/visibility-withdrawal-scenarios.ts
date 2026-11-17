@@ -42,7 +42,7 @@ const withdrawals = async (engine: BrainEngine) => Number((await engine.executeR
 /** 1a: a remote forget of an unlinked fact never names or withdraws a linked copy on a page the caller cannot read. */
 export async function unlinkedForgetKeepsHiddenCopies(engine: BrainEngine): Promise<void> {
   await seedPages(engine);
-  const hidden = await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-co', provenance: 'meeting notes' }, 'local');
+  const hidden = await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-co', provenance: 'meeting notes', visibility: 'world' }, 'local');
   expect(hidden.body.status).toBe('inserted');
   const unlinked = await call(engine, 'remember', { fact: CLAIM, provenance: 'call notes', infer_entity: false });
   const id = unlinked.body.id;
@@ -57,7 +57,7 @@ export async function unlinkedForgetKeepsHiddenCopies(engine: BrainEngine): Prom
   // Fail closed: a call that does not say it is local is treated as remote.
   expect((await call(engine, 'forget', { id: String(id) }, 'unset')).body.message).toBe(GENERIC_CLAIM_LINKED(id));
   // One fixed text whatever the number of hidden copies.
-  await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-two', provenance: 'meeting notes' }, 'local');
+  await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-two', provenance: 'meeting notes', visibility: 'world' }, 'local');
   const two = await call(engine, 'forget', { id: String(id) });
   expect(two.body.message).toBe(one.body.message);
   expect(two.body.suggestion).toBe(one.body.suggestion);
@@ -96,7 +96,11 @@ export async function hiddenWithdrawalRefusesGenerically(engine: BrainEngine): P
   const unset = await call(engine, 'remember', { fact: CLAIM, entity: 'crm/acme-example', provenance: 'call notes' }, 'unset');
   expect(unset.body.message).toBe(hiddenPage.body.message);
   const batch = await call(engine, 'remember', { items: [{ fact: CLAIM, entity: 'crm/acme-example', provenance: 'call notes' }] });
-  expect(batch.body.items[0].error.message).toBe(hiddenPage.body.message);
+  // #8621: a batch whose only item is refused is the item's refusal, prefixed with its index.
+  expect(batch.isError).toBe(true);
+  expect(batch.body.code).toBe(hiddenPage.body.code);
+  expect(batch.body.message).toBe(`items[0]: ${hiddenPage.body.message} None of the 1 item(s) was saved.`);
+  expect(JSON.stringify(batch.body)).not.toContain('withdrawn');
   // The local caller keeps fact_withdrawn.
   const local = await call(engine, 'remember', { fact: CLAIM, entity: 'crm/acme-example', provenance: 'call notes' }, 'local');
   expect(local.body.message).toBe(FACT_WITHDRAWN_MESSAGE);

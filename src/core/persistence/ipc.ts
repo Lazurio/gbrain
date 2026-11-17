@@ -1,12 +1,15 @@
 /** Dedicated, bounded local persistence transport. Hook IPC keeps its own small frame budget. */
 import net, { type Server, type Socket } from 'node:net';
+import { randomUUID } from 'node:crypto';
 import { chmodSync, lstatSync, unlinkSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
+import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
 import type { Action } from '../agent-output.ts';
 import type { ProjectionBacklog } from '../page-state/projections.ts';
 import { resolveSocketPathForConfig, socketHasLiveListener } from '../context/resolve-ipc.ts';
+import { ownerExceptionFailure, ownerExceptionLogText } from './publication-failure.ts';
 import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt, type WriteReceipt } from './types.ts';
 import { isPersistenceAdminExtension, isPersistenceAdminOperation, PERSISTENCE_ADMIN_EXTENSIONS, PERSISTENCE_ADMIN_OPERATIONS, type PersistenceAdminExtension, type PersistenceAdminOperation } from './admin-contract.ts';
 import { claimLocalIpcBinding, isWindowsIpcPipe, prepareLocalIpcPath } from '../context/ipc-path.ts';
@@ -17,14 +20,14 @@ export const PERSISTENCE_IPC_VERSION = 1;
 export const PERSISTENCE_IPC_MAX_BYTES = 32 * 1024 * 1024;
 export const PERSISTENCE_IPC_MAX_CONNECTIONS = 8;
 export const PERSISTENCE_IPC_OPERATIONS = [
-  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page',
+  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'append_page',
   'remember', 'forget', 'extract_facts', 'get_write_request', 'list_write_requests', 'cancel_write_request',
   'get_page', 'fetch', 'get_recent_transcripts',
   'list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack',
   'put_skill', 'delete_skill', 'join_brain', 'sync_brain_skills', 'leave_brain',
   'get_skill_policy', 'set_skill_policy', 'get_skill_retention', 'prune_skill_revisions',
   'retain_skill_revision', 'import_skill_proposal',
-  'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
+  'add_tag', 'remove_tag', 'add_timeline_entry', 'add_link', 'remove_link', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
   'purge_fact', 'list_page_purges', 'unpurge_page',
 ] as const;
 /**
@@ -37,9 +40,9 @@ export const LOCAL_CLI_OWNER_OPERATIONS: ReadonlySet<string> = new Set(['purge_f
 export type PersistenceIpcOperation = typeof PERSISTENCE_IPC_OPERATIONS[number];
 const OPERATIONS = new Set<string>(PERSISTENCE_IPC_OPERATIONS);
 const MUTATIONS = new Set<string>([
-  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'remember', 'forget', 'extract_facts',
+  'put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'append_page', 'remember', 'forget', 'extract_facts',
   'put_skill', 'delete_skill', 'import_skill_proposal',
-  'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
+  'add_tag', 'remove_tag', 'add_timeline_entry', 'add_link', 'remove_link', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove', 'takes_rebuild',
 ]);
 
 export interface PersistenceIpcRegistration {
@@ -59,6 +62,8 @@ export interface PersistenceIpcRequest {
   routing: { source: string | null; cwd: string };
   /** #5232: the caller's commit wait; sent only to owners advertising `write_wait`. */
   write_wait_ms?: number;
+  /** GBRA-498: the room the CLI's `--room` named; sent only to owners advertising `room`, which answer `{ [PERSISTENCE_ROOM_MARKED_KEY]: … }`. */
+  room?: string;
 }
 
 export interface PersistenceIpcCapabilities {
@@ -72,7 +77,14 @@ export interface PersistenceIpcCapabilities {
   administration_extensions?: readonly PersistenceAdminExtension[];
   /** #5232: the owner honors `write_wait_ms` on operation requests. */
   write_wait?: true;
+  /** GBRA-498: the owner marks its trusted local CLI's answer for a `room` on operation requests. */
+  room?: true;
 }
+
+/** GBRA-498: the one key of an owner's answer to a request that named a room: the marked result, its room meta and notices. */
+export const PERSISTENCE_ROOM_MARKED_KEY = 'room_marked';
+/** The longest `--room` a request carries; a longer one stays with the CLI, which marks every item unknown. */
+export const PERSISTENCE_ROOM_MAX_CHARS = 4_096;
 
 export interface PersistenceIpcAdminRequest {
   version: 1;
@@ -139,7 +151,8 @@ export function isPersistenceIpcRegistration(value: unknown): value is Persisten
 
 const OPERATION_REQUEST_KEYS = ['version', 'kind', 'brain_id', 'operation', 'params', 'registration', 'routing'];
 function operationRequest(value: unknown): value is PersistenceIpcRequest {
-  if (!record(value) || !(exactKeys(value, OPERATION_REQUEST_KEYS) || exactKeys(value, [...OPERATION_REQUEST_KEYS, 'write_wait_ms']))) return false;
+  if (!record(value) || !exactKeys(value, [...OPERATION_REQUEST_KEYS, ...['write_wait_ms', 'room'].filter(k => Object.prototype.hasOwnProperty.call(value, k))])) return false;
+  if (value.room !== undefined && !(typeof value.room === 'string' && value.room.length <= PERSISTENCE_ROOM_MAX_CHARS)) return false;
   if (value.write_wait_ms !== undefined && !(typeof value.write_wait_ms === 'number'
     && Number.isSafeInteger(value.write_wait_ms) && value.write_wait_ms >= 0)) return false;
   if (value.version !== 1 || value.kind !== 'operation' || !isWriteRequestId(value.brain_id)
@@ -167,10 +180,22 @@ const clientBug = (message: string): OperationError => opError('invalid_params',
   'This gbrain build produced a malformed local persistence request, so nothing was sent to the owner. It is a client fault, not a caller mistake: run gbrain doctor --json on this host and report it to the user with the command that failed.',
   { fix: readFix('Checks this installation and its persistence owner without changing anything.', { argv: ['gbrain', 'doctor', '--json'] }) });
 
-function publicError(error: unknown): Record<string, unknown> {
+/**
+ * #9224: an owner fault that is not an OperationError crosses the socket as `internal_error` with an incident ID,
+ * how to recover and a read-only fix naming the owner; the cause itself goes only to the owner's own stderr.
+ */
+function publicError(error: unknown, requestId?: string): Record<string, unknown> {
   if (error instanceof OperationError) return error.toJSON();
-  // Never reflect driver errors, SQL, credentials, or private payloads.
-  return { error: 'storage_error', message: 'The persistence owner could not complete this request.' };
+  const incident = randomUUID();
+  // Never reflect driver errors, SQL, credentials, or private payloads: the cause stays on this host's owner log.
+  try {
+    process.stderr.write(`[gbrain persistence] request failed in this owner (incident ${incident}):${redactConnectionInfo(ownerExceptionLogText(ownerExceptionFailure(error).detail))}\n`);
+  } catch { /* stderr gone */ }
+  return opError('internal_error', `The persistence owner failed while running this request (incident ${incident}); the request itself was not at fault.`,
+    `The process that holds this brain (the command in fix names it) hit an internal fault and wrote the cause to its own stderr under incident ${incident}; nothing about it crosses the local socket. ${requestId
+      ? `The write may have partly run: inspect request ${requestId} with gbrain write-request ${requestId} before resubmitting it. `
+      : ''}Restart that owner (for a gbrain serve an agent app launched, restart its MCP server or the agent session), then run the same command again; with no owner running, the CLI opens the brain itself. If it fails again after a restart, tell the user and give them the incident ID.`,
+    { detail: 'owner_internal', fix: writerStatusFix('Names the process that owns this brain (its PID, lane and gbrain version), read-only, so it can be restarted.') }).toJSON();
 }
 
 function responseFrame(value: unknown): string {
@@ -240,6 +265,7 @@ export async function startPersistenceIpcServer(
               max_frame_bytes: PERSISTENCE_IPC_MAX_BYTES,
               ...(provider.administer ? { administration: PERSISTENCE_ADMIN_OPERATIONS, administration_extensions: PERSISTENCE_ADMIN_EXTENSIONS } : {}),
               write_wait: true,
+              room: true,
             } satisfies PersistenceIpcCapabilities }));
             return;
           }
@@ -279,7 +305,7 @@ export async function startPersistenceIpcServer(
             error.requestId = mutation.requestId;
             if (mutation.receipt) error.writeRequest = publicWriteReceipt(mutation.receipt);
           }
-          if (!socket.destroyed) socket.end(responseFrame({ version: 1, ok: false, error: publicError(error) }));
+          if (!socket.destroyed) socket.end(responseFrame({ version: 1, ok: false, error: publicError(error, mutation?.requestId) }));
         } finally {
           if (admitted) active--;
         }
@@ -342,18 +368,60 @@ export class PersistenceIpcTransportError extends Error {
   }
 }
 
+/**
+ * GST-1387: a wire error body's recovery contract (canonical code, detail, retryable, fix) restored onto a rebuilt
+ * OperationError, so a refresh fence stays worktree_refreshing with fix.next wait across the owner hop. Only the fence's
+ * fix (read-only, no consent) is carried: a rendered fix drops `ask_user`, and a receipt's fix is rendered on this side.
+ */
+export function restoreRecoveryContract(error: OperationError, body: Record<string, unknown>): void {
+  if (typeof body.code === 'string' && body.code !== error.code) error.canonical = body.code as OperationError['canonical'];
+  if (typeof body.detail === 'string') error.detail = body.detail;
+  if (typeof body.retryable === 'boolean') error.retryable = body.retryable;
+  if (record(body.fix) && body.code === 'worktree_refreshing') { const { next: _next, command: _command, ...fix } = body.fix; error.fix = fix as unknown as Action; }
+}
+
 function remoteOperationError(value: unknown): OperationError {
   if (!record(value) || typeof value.error !== 'string' || typeof value.message !== 'string') {
     throw new Error('Malformed persistence error response.');
   }
   const error = new OperationError(value.error, value.message, typeof value.suggestion === 'string' ? value.suggestion : undefined,
     typeof value.docs === 'string' ? value.docs : undefined);
-  if (typeof value.detail === 'string') error.detail = value.detail;
   if (typeof value.protocol_version === 'number') error.protocolVersion = value.protocol_version;
+  restoreRecoveryContract(error, value);
   if (isWriteReceipt(value.write_request)) error.writeRequest = publicWriteReceipt(value.write_request);
   if (isWriteRequestId(value.request_id)) error.requestId = value.request_id;
   if (isWriteErrorCode(value.write_error)) error.writeError = value.write_error;
+  if (typeof value.why === 'string') error.why = value.why;
+  if (typeof value.reason === 'string') error.reason = value.reason;
+  if (value.contract_version === 1) error.contractVersion = 1;
+  const fix = wireAction(value.fix);
+  if (fix) error.fix = fix;
   return error;
+}
+
+/**
+ * #7707, #8130: the owner sends a refusal's `fix` already rendered (`toJSON`), or as the stored Action when it never loaded the renderer.
+ * Back to an Action, so a delegated refusal prints the same structured fix as the direct path; a value of any other shape is dropped.
+ */
+function wireAction(value: unknown): Action | undefined {
+  if (!record(value) || !Array.isArray(value.consent) || typeof value.actor !== 'string' || typeof value.why !== 'string'
+    || typeof value.requires_exclusive !== 'boolean') return undefined;
+  const argv = Array.isArray(value.argv) && value.argv.every(arg => typeof arg === 'string') ? value.argv as string[] : undefined;
+  const mcp = record(value.mcp) && typeof value.mcp.tool === 'string' && record(value.mcp.arguments) ? value.mcp as unknown as Action['mcp'] : undefined;
+  if (!argv && !mcp) return undefined;
+  const then = value.then === undefined ? undefined : wireAction(value.then);
+  return {
+    ...(value.next === 'ask_user' || value.ask_user === true ? { ask_user: true as const } : {}),
+    ...(argv ? { argv } : {}), ...(mcp ? { mcp } : {}),
+    consent: value.consent as Action['consent'], actor: value.actor as Action['actor'], why: value.why, requires_exclusive: value.requires_exclusive,
+    ...(typeof value.user_message === 'string' ? { user_message: value.user_message } : {}),
+    ...(record(value.verify) ? { verify: value.verify as Action['verify'] } : {}),
+    ...(typeof value.docs === 'string' ? { docs: value.docs } : {}),
+    ...(Array.isArray(value.inputs) ? { inputs: value.inputs as Action['inputs'] } : {}),
+    ...(typeof value.plan_hash === 'string' ? { plan_hash: value.plan_hash } : {}),
+    ...(Array.isArray(value.preview_argv) && value.preview_argv.every(arg => typeof arg === 'string') ? { preview_argv: value.preview_argv as string[] } : {}),
+    ...(then ? { then } : {}),
+  };
 }
 
 /** One bounded exchange. No automatic reconnect or replay after any request bytes are sent. */
