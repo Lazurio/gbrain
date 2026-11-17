@@ -13,10 +13,12 @@
 #   1. stops the server, backs up ~/.gbrain, the vault and its remote;
 #   2. starts <to-ref> on the same brain (its migrations run at start);
 #   3. compares counts, ids, links, recall, token names and scopes, and the
-#      tool surface (no tool or parameter removed, retyped or newly required);
+#      tool surface (no tool or parameter removed, retyped, newly required or
+#      newly constrained, e.g. an enum added to a free string);
 #   4. checks the vault: no file changed by the upgrade, a new write commits
-#      and pushes;
-#   5. starts <from-ref> again on the migrated brain (the way back);
+#      and pushes, with recall counting the new fact;
+#   5. starts <from-ref> again on the migrated brain (the way back): recall
+#      answers with every fact and a new remember commits and pushes;
 #   6. restores the backup and checks it equals the starting snapshot.
 # Everything stays under <work-dir> and on 127.0.0.1:<port>. No real data.
 set -euo pipefail
@@ -116,9 +118,25 @@ for mode in ('rw', 'ro'):
         p1, p2 = s1.get('properties', {}), s2.get('properties', {})
         rem = sorted(set(p1) - set(p2))
         typ = sorted(k for k in set(p1) & set(p2) if p1[k].get('type') != p2[k].get('type')
-                     or set(p1[k].get('enum') or []) - set(p2[k].get('enum') or []))
+                     or (p1[k].get('items') or {}).get('type') != (p2[k].get('items') or {}).get('type'))
+        # A parameter accepts less when the new version adds a constraint it did
+        # not have (an enum on a free string, a pattern, a bound) or changes one.
+        # Changed constraints are reported even when they widen; a person checks.
+        tight = []
+        for k in sorted(set(p1) & set(p2)):
+            for c in ('enum', 'const', 'pattern', 'format', 'minimum', 'maximum', 'exclusiveMinimum',
+                      'exclusiveMaximum', 'minLength', 'maxLength', 'minItems', 'maxItems'):
+                a, b = p1[k].get(c), p2[k].get(c)
+                if b is None or a == b:
+                    continue
+                if c == 'enum' and a is not None and set(a) <= set(b):
+                    continue  # only values added: accepts more
+                tight.append(f'{k}.{c}: {a!r} -> {b!r}')
         req = sorted(set(s2.get('required', [])) - set(s1.get('required', [])))
-        if rem or typ or req: problems.append(f'{mode} {n}: removed {rem} retyped {typ} newly required {req}')
+        if s1.get('additionalProperties') is not False and s2.get('additionalProperties') is False:
+            tight.append('additionalProperties: now false')
+        if rem or typ or req or tight:
+            problems.append(f'{mode} {n}: removed {rem} retyped {typ} newly required {req} constrained {tight}')
 print('PROBLEMS:' if problems else 'compare: ok', *problems, sep='\n  ')
 sys.exit(1 if problems else 0)
 EOF
@@ -126,18 +144,38 @@ EOF
 say "vault"
 diff -rq --exclude=.git "$WORK/backup/vault" "$VAULT" && echo "vault unchanged by the upgrade" || fail "upgrade changed vault files"
 HEAD0=$(git -C "$REMOTE" rev-parse main)
-py mcp.py call "$BASE" "$TOK/executor-personal-gbrain" remember '{"source_id":"default","entity":"bob-tester","fact":"Written after the upgrade.","kind":"fact","visibility":"world","provenance":"gbrain upgrade test"}' > "$WORK/remember-after.json"
-for _ in $(seq 1 60); do [ "$(git -C "$REMOTE" rev-parse main)" != "$HEAD0" ] && break; sleep 1; done
-[ "$(git -C "$REMOTE" rev-parse main)" != "$HEAD0" ] || fail "write after upgrade did not reach the remote"
-git -C "$REMOTE" diff --stat "$HEAD0" main
-py mcp.py mint "$BASE" "$H/.gbrain/serve/admin-token" lazurio-read-after-upgrade read "$TOK/after" > /dev/null && echo "read key minted on to"
+# write_and_check <label> <token> <fact>: remember over MCP must insert, and the
+# commit must reach the remote with exactly one changed file.
+write_and_check() {
+  local head0 out; head0=$(git -C "$REMOTE" rev-parse main); out=$WORK/remember-$1.json
+  py mcp.py call "$BASE" "$2" remember "{\"source_id\":\"default\",\"entity\":\"bob-tester\",\"fact\":\"$3\",\"kind\":\"fact\",\"visibility\":\"world\",\"provenance\":\"gbrain upgrade test\"}" > "$out"
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));r=d["result"] if isinstance(d["result"],dict) else {};sys.exit(0 if not d["isError"] and r.get("status")=="inserted" else 1)' "$out" \
+    || fail "$1: remember was not inserted ($(head -c 300 "$out"))"
+  for _ in $(seq 1 60); do [ "$(git -C "$REMOTE" rev-parse main)" != "$head0" ] && break; sleep 1; done
+  [ "$(git -C "$REMOTE" rev-parse main)" != "$head0" ] || fail "$1: the write did not reach the remote"
+  [ "$(git -C "$REMOTE" diff --name-only "$head0" main)" = "people/bob-tester.md" ] || fail "$1: the write changed other files"
+  echo "$1: remember inserted, committed and pushed (people/bob-tester.md)"
+}
+# recall_total <label> <expected>: recall for bob-tester answers without error with <expected> facts.
+recall_total() {
+  py mcp.py call "$BASE" "$TOK/hermes-buddy" recall '{"entity":"bob-tester"}' > "$WORK/recall-$1.json"
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));r=d["result"] if isinstance(d["result"],dict) else {};sys.exit(0 if not d["isError"] and r.get("total")==int(sys.argv[2]) else 1)' "$WORK/recall-$1.json" "$2" \
+    || fail "$1: recall did not return $2 facts ($(head -c 300 "$WORK/recall-$1.json"))"
+  echo "$1: recall returned $2 facts"
+}
+BOB=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["calls"]["recall"]["bob-tester"]["total"])' "$WORK/snap-from.json")
+write_and_check after-upgrade "$TOK/executor-personal-gbrain" "Written after the upgrade."
+recall_total after-upgrade $((BOB + 1))
+py mcp.py mint "$BASE" "$H/.gbrain/serve/admin-token" lazurio-read-after-upgrade read "$TOK/after" > /dev/null || fail "read key not minted on to"
+echo "read key minted on to"
 
 say "way back: from on the migrated brain"
 serve "$WORK/to" stop
-if serve "$WORK/from" start; then
-  py mcp.py call "$BASE" "$TOK/hermes-buddy" recall '{"entity":"bob-tester"}' | json_field '"recall total %s, error %s" % (d["result"].get("total"), d["isError"])'
-  serve "$WORK/from" stop
-fi
+serve "$WORK/from" start
+recall_total way-back $((BOB + 1))
+write_and_check way-back "$TOK/hermes-buddy" "Written by the earlier release after the way back."
+recall_total way-back-after-write $((BOB + 2))
+serve "$WORK/from" stop
 
 say "restore the backup"
 rm -rf "$H/.gbrain" "$VAULT" "$REMOTE"
