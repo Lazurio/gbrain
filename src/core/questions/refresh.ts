@@ -17,6 +17,8 @@
  *    lease, the pin revision and every cited dependency revision. Any change
  *    rejects publication, so the previous answer keeps its stale flags.
  *    A failure anywhere keeps the previous answer; the error is recorded.
+ *    #7306: a reply cut off at the output cap fails `refresh_failed:answer_too_long:<cap>` without the JSON retry;
+ *    the cycle phase does not retry that pin until the cap is raised.
  */
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
@@ -29,14 +31,17 @@ import { classifyLlmCallFailure } from '../think/index.ts';
 import { PINNED_QUESTION_MARKER, normalizeQuestion, sentenceId } from './identity.ts';
 import { entityAnchoredPages, prefixAnchoredPages } from '../search/entity-anchor.ts';
 import { quarantinedProvenanceFilterFragment, quarantineFilterFragment } from '../quarantine.ts';
+import { projectionEligibleSql } from '../eligibility/sql.ts';
 import { FACT_HASH_SQL, OWNER_BODY_HASH_SQL, TAKE_HASH_SQL, TIMELINE_HASH_SQL, evaluateAnswer, type EvidenceKind } from './freshness.ts';
 import { ownerClaims, readQuestionPage } from './pages.ts';
+import { neutralizeForPrompt } from '../think/sanitize.ts';
 import { acquireLease, getPin, pinId, releaseLease, type AnswerSentence, type PinRow } from './store.ts';
 
-export type BlockedReason = 'no_model_key' | 'budget_exhausted' | 'no_worker' | 'refresh_failed' | 'awaiting_consent';
+export type BlockedReason = 'no_model_key' | 'budget_exhausted' | 'no_worker' | 'refresh_failed' | 'answer_too_long' | 'awaiting_consent';
 
 export interface QuestionChatRequest { model: string; system: string; user: string; maxTokens: number; signal?: AbortSignal }
-export interface QuestionChatResponse { text: string; usage: { input_tokens: number; output_tokens: number } | null; model: string }
+/** `truncated`: the reply stopped at the output cap (`maxTokens`), so its text is cut off. */
+export interface QuestionChatResponse { text: string; usage: { input_tokens: number; output_tokens: number } | null; model: string; truncated?: boolean }
 export type QuestionChatFn = (req: QuestionChatRequest) => Promise<QuestionChatResponse>;
 
 /** Test-only crash and race injection points around publication. */
@@ -67,7 +72,12 @@ export type RefreshOutcome =
   | { status: 'skipped'; reason: 'archived' };
 
 export const EST_INPUT_TOKENS = 8_000;
-export const MAX_OUTPUT_TOKENS = 2_000;
+/** The output cap of one refresh call; `cycle.standing_questions.max_output_tokens` overrides it. */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 2_000;
+export const MAX_OUTPUT_TOKENS_KEY = 'cycle.standing_questions.max_output_tokens';
+/** #7306: `refresh_failed:answer_too_long:<cap>` records an answer that did not fit the cap; the same cap fails the same way. */
+export const ANSWER_TOO_LONG_ERROR = 'refresh_failed:answer_too_long';
+const OUTPUT_CAP_ERROR = /exceeded the \d+ output token maximum/i;
 const MAX_PAGES = 16;
 const MAX_FACTS = 30;
 const MAX_TIMELINE = 20;
@@ -104,8 +114,22 @@ export function chatKeyAvailable(model: string): boolean {
 const gatewayQuestionChat: QuestionChatFn = async (req) => {
   const r = await gatewayChat({ model: normalizeModelId(req.model), system: req.system, messages: [{ role: 'user', content: req.user }],
     maxTokens: req.maxTokens, allowFallback: false, ...(req.signal ? { abortSignal: req.signal } : {}) });
-  return { text: r.text, usage: { input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens }, model: r.model };
+  return { text: r.text, usage: { input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens }, model: r.model, truncated: r.stopReason === 'length' };
 };
+
+export async function resolveMaxOutputTokens(engine: BrainEngine): Promise<number> {
+  const n = Number((await engine.getConfig(MAX_OUTPUT_TOKENS_KEY).catch(() => null)) ?? NaN);
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_MAX_OUTPUT_TOKENS;
+}
+
+/** The cap an `answer_too_long` failure recorded, or null when the error is another one. */
+export function answerTooLongCap(lastError: string | null): number | null {
+  if (!lastError?.startsWith(`${ANSWER_TOO_LONG_ERROR}:`)) return null;
+  const cap = Number(lastError.slice(ANSWER_TOO_LONG_ERROR.length + 1));
+  return Number.isInteger(cap) && cap > 0 ? cap : null;
+}
+
+class AnswerTooLong extends Error {}
 
 function costUsd(model: string, usage: QuestionChatResponse['usage']): number {
   const p = canonicalLookup(normalizeModelId(model)) ?? canonicalLookup(model);
@@ -202,18 +226,19 @@ export async function retrieveEvidence(engine: BrainEngine, pin: PinRow): Promis
       `SELECT f.id, f.fact, f.entity_slug, f.valid_from, ${FACT_HASH_SQL('f')} AS hash FROM facts f
        WHERE f.source_id = $1 AND f.entity_slug = ANY($2::text[]) AND f.expired_at IS NULL AND f.superseded_by IS NULL
          AND (f.valid_until IS NULL OR f.valid_until > now()) AND ${quarantinedProvenanceFilterFragment('f')}
+         AND ${projectionEligibleSql('facts', 'f', undefined)}
          AND NOT EXISTS (SELECT 1 FROM pages fp WHERE fp.source_id = f.source_id AND fp.slug = f.source_markdown_slug
            AND (fp.type IN ('question', 'synthesis') OR fp.frontmatter ? '${PINNED_QUESTION_MARKER}'))
        ORDER BY f.valid_from DESC, f.id DESC LIMIT ${MAX_FACTS}`, [pin.source_id, entitySlugs]);
     for (const f of facts) {
       push({ kind: 'fact', source_id: pin.source_id, page_id: null, page_slug: f.entity_slug, page_generation: null, page_revision: null,
-        item_id: Number(f.id), content_hash: f.hash, text: `[fact about ${f.entity_slug ?? 'unknown'}, from ${String(f.valid_from).slice(0, 10)}] ${f.fact}` });
+        item_id: Number(f.id), content_hash: f.hash, text: `[fact about ${f.entity_slug ?? 'unknown'}, from ${String(f.valid_from).slice(0, 10)}] ${neutralizeForPrompt(f.fact).text}` });
     }
   }
   if (pageIds.length > 0) {
     const timeline = await engine.executeRaw<{ id: number; date: unknown; summary: string; detail: string; page_id: number; slug: string; generation: string | number; revision: string | null; hash: string }>(
       `SELECT t.id, t.date, t.summary, t.detail, p.id AS page_id, p.slug, p.generation, p.knowledge_revision::text AS revision, ${TIMELINE_HASH_SQL('t')} AS hash
-       FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.id = ANY($1::integer[]) ORDER BY t.date DESC, t.id DESC LIMIT ${MAX_TIMELINE}`, [pageIds]);
+       FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.id = ANY($1::integer[]) AND ${projectionEligibleSql('timeline_entries', 't', undefined)} ORDER BY t.date DESC, t.id DESC LIMIT ${MAX_TIMELINE}`, [pageIds]);
     for (const t of timeline) {
       push({ kind: 'timeline', source_id: pin.source_id, page_id: t.page_id, page_slug: t.slug, page_generation: Number(t.generation),
         page_revision: t.revision, item_id: t.id, content_hash: t.hash, text: `[timeline ${t.slug} ${String(t.date).slice(0, 10)}] ${t.summary}${t.detail ? ` — ${t.detail.slice(0, 300)}` : ''}` });
@@ -221,6 +246,7 @@ export async function retrieveEvidence(engine: BrainEngine, pin: PinRow): Promis
     const takes = await engine.executeRaw<{ id: string | number; claim: string; holder: string; weight: number | null; page_id: number; slug: string; generation: string | number; revision: string | null; hash: string }>(
       `SELECT k.id, k.claim, k.holder, k.weight, p.id AS page_id, p.slug, p.generation, p.knowledge_revision::text AS revision, ${TAKE_HASH_SQL('k')} AS hash
        FROM takes k JOIN pages p ON p.id = k.page_id WHERE p.id = ANY($1::integer[]) AND k.active AND k.superseded_by IS NULL
+         AND ${projectionEligibleSql('takes', 'k', undefined)}
        ORDER BY k.id DESC LIMIT ${MAX_TAKES}`, [pageIds]);
     for (const k of takes) {
       push({ kind: 'take', source_id: pin.source_id, page_id: k.page_id, page_slug: k.slug, page_generation: Number(k.generation),
@@ -358,8 +384,9 @@ export async function refreshPin(engine: BrainEngine, sourceId: string, slug: st
     await recordBlocked(engine, pin.id, 'no_model_key');
     return { status: 'blocked', blocked_reason: 'no_model_key', detail: `no usable chat key for ${model}` };
   }
+  const maxTokens = await resolveMaxOutputTokens(engine);
   if (opts.meter) {
-    const check = opts.meter.check({ modelId: model, estimatedInputTokens: EST_INPUT_TOKENS, maxOutputTokens: MAX_OUTPUT_TOKENS, label: `standing_questions:${pinId(pin)}` });
+    const check = opts.meter.check({ modelId: model, estimatedInputTokens: EST_INPUT_TOKENS, maxOutputTokens: maxTokens, label: `standing_questions:${pinId(pin)}` });
     if (!check.allowed) {
       await recordBlocked(engine, pin.id, 'budget_exhausted');
       return { status: 'blocked', blocked_reason: 'budget_exhausted', detail: check.reason ?? 'budget exhausted' };
@@ -384,20 +411,22 @@ export async function refreshPin(engine: BrainEngine, sourceId: string, slug: st
     opts.signal?.throwIfAborted();
     stage = 'model';
     const chat = opts.chat ?? gatewayQuestionChat;
-    const request = { model, system: SYSTEM_PROMPT, user: buildPrompt(leased, items, owner, full ? null : previous), maxTokens: MAX_OUTPUT_TOKENS, signal: opts.signal };
+    const request = { model, system: SYSTEM_PROMPT, user: buildPrompt(leased, items, owner, full ? null : previous), maxTokens, signal: opts.signal };
     let response = await chat(request);
     spend = costUsd(response.model || model, response.usage);
+    if (response.truncated) throw new AnswerTooLong(`the answer did not fit the ${maxTokens}-token output cap (${MAX_OUTPUT_TOKENS_KEY})`);
     stage = 'parse';
     let parsed: ReturnType<typeof parseModelAnswer>;
     try {
       parsed = parseModelAnswer(response.text, items);
     } catch (e) {
       if (!(e instanceof Error && e.message === 'model_output_not_json')) throw e;
-      if (opts.meter && !opts.meter.check({ modelId: model, estimatedInputTokens: EST_INPUT_TOKENS, maxOutputTokens: MAX_OUTPUT_TOKENS, label: `standing_questions:${pinId(pin)}:retry` }).allowed) throw e;
+      if (opts.meter && !opts.meter.check({ modelId: model, estimatedInputTokens: EST_INPUT_TOKENS, maxOutputTokens: maxTokens, label: `standing_questions:${pinId(pin)}:retry` }).allowed) throw e;
       opts.signal?.throwIfAborted();
       stage = 'model';
       response = await chat({ ...request, user: `${request.user}\n\n${JSON_RETRY_NOTE}` });
       spend += costUsd(response.model || model, response.usage);
+      if (response.truncated) throw new AnswerTooLong(`the answer did not fit the ${maxTokens}-token output cap (${MAX_OUTPUT_TOKENS_KEY})`);
       stage = 'parse';
       parsed = parseModelAnswer(response.text, items);
     }
@@ -453,7 +482,8 @@ export async function refreshPin(engine: BrainEngine, sourceId: string, slug: st
       return { status: 'timeout', cost_usd: spend };
     }
     const message = e instanceof Error ? e.message : String(e);
-    const code = message === 'model_output_not_json' ? 'refresh_failed:model_output_not_json'
+    const code = e instanceof AnswerTooLong || (stage === 'model' && OUTPUT_CAP_ERROR.test(message)) ? `${ANSWER_TOO_LONG_ERROR}:${maxTokens}`
+      : message === 'model_output_not_json' ? 'refresh_failed:model_output_not_json'
       : `refresh_failed:${stage === 'model' ? classifyLlmCallFailure(e) : stage}`;
     process.stderr.write(`[questions] refresh of ${pinId(pin)} failed: ${message}\n`);
     await releaseLease(engine, pin.id, token, { error: code, spendUsd: spend });

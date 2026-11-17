@@ -156,7 +156,10 @@ purged.
 `gbrain doctor` reports the `auto_chronicle` check: whether it is on, 24 h use
 of the daily limit and the largest writer's share, 7-day outcomes and spend
 (priced dollars, unpriced calls and calls without a cost record are listed
-apart), pending pages and the command that runs them.
+apart), pending pages and the command that runs them. `chronicle_duplicate_events`
+(info) counts pages that still hold events from earlier extraction runs beside
+their newest run's, such as the reworded copies releases before #8972 added on
+long conversations; it changes nothing.
 
 ## After upgrading
 
@@ -258,6 +261,8 @@ brackets are filled in with real values on each surface.
 | `no_write_decision` | discovery | This revision has no recorded write decision (written by an older binary or before this release activated), so only a trusted backfill extracts it. | `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --yes` (preview: `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --dry-run`) | agent | paid |
 | `not_chronicle_shaped` | decision | The page is no longer a meeting, conversation or calendar page, so the events extracted from it were retired. | — | — | — |
 | `already_extracted` | decision | This exact content was already extracted; its events are current, so no new call is made. | — | — | — |
+| `judge_input_unchanged` | execution | Nothing the extraction reads changed since the page was last extracted (for example only text past a long page's first 12,000 characters changed), so the earlier events are current and no new call is made. | — | — | — |
+| `judge_input_failed` | execution | Earlier revisions of the page already spent every extraction attempt on exactly this text without publishing events (the judge's answer was cut off, unreadable, malformed or over the per-page spend cap), so it is not paid for again until the text extraction reads changes. | `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --yes` (preview: `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --dry-run`) | agent | paid |
 | `superseded` | execution | A newer revision replaced this content before extraction ran; the newer revision carries its own decision. | — | — | — |
 | `daily_limit` | execution | The automatic daily limit (chronicle.auto_daily_limit = 200 calls per rolling 24 hours) is used up; pending pages wait for a free slot. | `gbrain config set chronicle.auto_daily_limit 400` | agent | paid |
 | `judge_llm_unavailable` | execution | No chat provider is configured on the brain host, so extraction cannot run. | — | user | credentials |
@@ -277,8 +282,31 @@ brackets are filled in with real values on each surface.
 | `no_chat_provider` | phase | No chat provider is configured on the brain host, so the chronicle phase made no calls. | — | user | credentials |
 <!-- chronicle-reasons:end -->
 
+A `malformed_proposal` refusal also says which check failed, without the
+proposal itself. The chronicle phase prints one warning line per refused page
+(`code=when_unparseable field=when; proposal 2 of 7; 1 of 7 inspected invalid`),
+and the extractor result carries the same fields under `malformed`: `code`
+(`not_object`, `missing_field`, `wrong_type`, `when_too_short`,
+`when_unparseable`, `what_blank`, `who_item_not_string`, or `beyond_bounds`
+when the defect lies past what was inspected), the schema `field`, the JSON
+`shape` found there, and counts. It never contains a value, a key the model
+invented, the prompt or the raw response. At most 50 proposals, 50 `who`
+entries each and 256 characters per string are inspected, and nested values
+are never walked. The refusal itself, its retry with backoff and the ledger
+row are unchanged.
+
 Don't hand-write `life/events/` pages: extraction owns them and retires events
 the page no longer supports. Edit the meeting page instead. Only a complete
 re-extraction retires events: one that finds no events, drops or caps a
 proposal, or reads a page longer than the judge's window keeps the earlier
-events live.
+events live. A page longer than the window counts as complete when the window
+still starts with all the text the live events came from (the conversation
+only grew at the end), so a re-extraction of it replaces them. A revision that
+changes nothing extraction reads (for example only a long conversation's
+newest messages, past the window) makes no call at all and records
+`judge_input_unchanged`, and text the judge keeps failing on is paid for at
+most the attempt limit across revisions (`judge_input_failed`). An extraction
+that dropped proposals over `chronicle.max_events_per_page` is asked again
+when that setting changes, and one that dropped proposals dated after the
+page's last day is asked again once that day moves. Text past the
+first 12,000 characters is not extracted yet.

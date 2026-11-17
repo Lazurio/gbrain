@@ -24,6 +24,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { WriteRequest } from '../persistence/model.ts';
 import { CONNECTOR_SOURCE_KINDS } from '../persistence/connector-identity.ts';
+import { asciiLower, asciiLowerSql, edgeTrimSql } from '../edge-whitespace.ts';
 import {
   CONTENT_ORIGINS, OWNER_TIER_FLOOR, TRUST_TIER_RANK, compareTrust, contentOriginTier, effectiveWriteTrust, isTrustTier, minTrust, trustRankSql,
   type ContentOrigin, type TrustTier, type WriteTrust,
@@ -31,8 +32,8 @@ import {
 
 /** Journaled verbs an agent (remote or local) calls directly; their rows are agent_written unless lowered. */
 export const AGENT_WRITE_OPERATIONS: readonly string[] = [
-  'put_page', 'put_pages', 'capture', 'edit_page', 'delete_page', 'restore_page', 'revert_version', 'remember',
-  'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve',
+  'put_page', 'put_pages', 'capture', 'edit_page', 'append_page', 'delete_page', 'restore_page', 'revert_version', 'remember',
+  'add_tag', 'remove_tag', 'add_timeline_entry', 'add_link', 'remove_link', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve',
   'takes_remove', 'loops_close', 'relink_facts', 'decide_proposal',
 ];
 
@@ -42,10 +43,12 @@ export const AGENT_WRITE_OPERATIONS: readonly string[] = [
  */
 const OWNER_SOURCE_KINDS = ['canonical_reconcile', 'managed_file_import', 'managed_file_repair', 'managed_grandfather', 'managed_quarantine_clear'];
 
+/** The `captured_via` stamp of a Life Chronicle event page (chronicle/publish.ts): model-extracted from its depth page. */
+export const CHRONICLE_CAPTURED_VIA = 'life-chronicle:auto';
 /** Page frontmatter `source_kind` / `ingested_via` / `captured_via` values written by an ingestion capture (external). */
 export const EXTERNAL_CAPTURE_KINDS: readonly string[] = ['webhook', 'file-watcher', 'inbox-folder', 'cron-scheduler', 'ingest_capture'];
-/** ...and by an agent through a gbrain verb (agent_written). */
-const AGENT_CAPTURE_KINDS = ['put_page', 'capture-cli', 'capture-mcp', 'capture'];
+/** ...and by an agent through a gbrain verb, or by the Life Chronicle extractor (agent_written). */
+const AGENT_CAPTURE_KINDS = ['put_page', 'capture-cli', 'capture-mcp', 'capture', CHRONICLE_CAPTURED_VIA];
 /**
  * Harnesses whose `transcript_import` pages are the user's own sessions with
  * their agent (or their own chat exports): relayed user turns count as
@@ -95,7 +98,7 @@ export function requestChannelTrust(row: Pick<WriteRequest, 'id' | 'operation' |
     return effectiveWriteTrust({ channel: 'agent_written', lowerTo: lowered ? [lowered] : [], origin });
   }
   if (kind.startsWith('managed_sync_') || kind.startsWith('managed_maintenance_') || kind.startsWith('managed_facts_')
-    || kind.startsWith('managed_atom_') || OWNER_SOURCE_KINDS.includes(kind)) return undefined;
+    || kind.startsWith('managed_atom_') || kind.startsWith('managed_generation_') || OWNER_SOURCE_KINDS.includes(kind)) return undefined;
   if (AGENT_WRITE_OPERATIONS.includes(row.operation)) {
     const lowered = intentContentOrigin(row.intent);
     return effectiveWriteTrust({ channel: 'agent_written', lowerTo: lowered ? [lowered] : [], origin });
@@ -136,7 +139,7 @@ export function frontmatterTrustCaps(frontmatter: Record<string, unknown> | null
   }
   const transcript = fm.transcript_import as { harness?: unknown } | undefined;
   if (transcript && typeof transcript === 'object') {
-    caps.push(OWN_SESSION_HARNESSES.includes(str(transcript.harness).toLowerCase()) ? 'agent_written' : 'external_untrusted');
+    caps.push(OWN_SESSION_HARNESSES.includes(asciiLower(str(transcript.harness))) ? 'agent_written' : 'external_untrusted');
   }
   if (str(fm.source_url) && (str(fm.clipped_at) || str(fm.clipper) || str(fm.captured_via) === 'clipper' || str(fm.type) === 'clipping')) {
     caps.push('external_untrusted');
@@ -155,7 +158,7 @@ export function frontmatterTrustCaps(frontmatter: Record<string, unknown> | null
  */
 export function frontmatterTrustCapsSql(fm: string): string[] {
   const list = (values: readonly string[]) => values.map(v => `'${v.replace(/'/g, "''")}'`).join(',');
-  const text = (key: string, base = fm) => `(CASE WHEN jsonb_typeof(${base}->'${key}') = 'string' THEN NULLIF(btrim(${base}->>'${key}', E' \\t\\n\\r'), '') END)`;
+  const text = (key: string, base = fm) => `(CASE WHEN jsonb_typeof(${base}->'${key}') = 'string' THEN NULLIF(${edgeTrimSql(`${base}->>'${key}'`)}, '') END)`;
   const stamp = (key: string) => `CASE WHEN ${text(key)} IN (${list(EXTERNAL_CAPTURE_KINDS)}) THEN ${TRUST_TIER_RANK.external_untrusted}
     WHEN ${text(key)} LIKE 'mcp:%' OR ${text(key)} IN (${list(AGENT_CAPTURE_KINDS)}) THEN ${TRUST_TIER_RANK.agent_written}
     WHEN ${text(key)} LIKE 'connector:%' OR ${text(key)} IN (${list(CONNECTOR_SOURCE_KINDS)}) THEN ${TRUST_TIER_RANK.external_untrusted} END`;
@@ -163,7 +166,7 @@ export function frontmatterTrustCapsSql(fm: string): string[] {
     `CASE WHEN jsonb_typeof(${fm}->'trust_tier') = 'string' THEN NULLIF(${trustRankSql(`(${fm}->>'trust_tier')`)}, 0) END`,
     ...['source_kind', 'ingested_via', 'captured_via'].map(stamp),
     `CASE WHEN jsonb_typeof(${fm}->'transcript_import') IN ('object', 'array') THEN
-      CASE WHEN lower(${text('harness', `(${fm}->'transcript_import')`)}) IN (${list(OWN_SESSION_HARNESSES)}) THEN ${TRUST_TIER_RANK.agent_written} ELSE ${TRUST_TIER_RANK.external_untrusted} END END`,
+      CASE WHEN ${asciiLowerSql(text('harness', `(${fm}->'transcript_import')`))} IN (${list(OWN_SESSION_HARNESSES)}) THEN ${TRUST_TIER_RANK.agent_written} ELSE ${TRUST_TIER_RANK.external_untrusted} END END`,
     `CASE WHEN ${text('source_url')} IS NOT NULL AND (${text('clipped_at')} IS NOT NULL OR ${text('clipper')} IS NOT NULL
       OR ${text('captured_via')} = 'clipper' OR ${text('type')} = 'clipping') THEN ${TRUST_TIER_RANK.external_untrusted} END`,
     `CASE WHEN ${text('provenance')} = 'auto-extracted' OR ${fm}->'dream_generated' = 'true'::jsonb OR ${text('dream_generated')} = 'true'
@@ -209,6 +212,9 @@ export function stampTrustMarker(frontmatter: Record<string, unknown>, tier: Tru
   return { ...frontmatter, trust_tier: marker };
 }
 
+/** The source config `ownerImportTrust` reads. */
+export const SOURCE_TRUST_CONFIG_SQL = 'SELECT config FROM sources WHERE id = $1';
+
 /**
  * The tier of a journaled owner-source write of one page (managed sync,
  * import, reconcile, file repair, grandfather): `ownerPageTrust` from the
@@ -216,7 +222,7 @@ export function stampTrustMarker(frontmatter: Record<string, unknown>, tier: Tru
  */
 export async function ownerImportTrust(engine: Pick<BrainEngine, 'executeRaw'>, row: Pick<WriteRequest, 'id' | 'source_id' | 'authority' | 'intent' | 'operation'>,
   frontmatter: Record<string, unknown> | null | undefined, sourceUri?: string | null): Promise<WriteTrust> {
-  const [source] = await engine.executeRaw<{ config: Record<string, unknown> | string | null }>('SELECT config FROM sources WHERE id = $1', [row.source_id]);
+  const [source] = await engine.executeRaw<{ config: Record<string, unknown> | string | null }>(SOURCE_TRUST_CONFIG_SQL, [row.source_id]);
   const config = typeof source?.config === 'string' ? JSON.parse(source.config) as Record<string, unknown> : source?.config ?? null;
   const trust = ownerPageTrust({ frontmatter, sourceConfig: config, channel: requestChannel(row), requestId: row.id, sourceUri });
   return row.authority?.remote === true ? { ...trust, tier: minTrust(trust.tier, 'agent_written') } : trust;

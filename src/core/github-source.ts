@@ -3,6 +3,7 @@ import { resolveGitHubAccount } from './persistence/connector-account.ts';
 import { isValidRepoName } from './github-source-config.ts';
 import { connectorRender } from './connectors/connector-text.ts';
 import { ConnectorHoldSession, connectorHoldsResult } from './connectors/connector-hold-session.ts';
+import { connectorDryRunResult } from './connectors/api-source.ts';
 export { isValidRepoName, parseGitHubSourceConfig } from './github-source-config.ts';
 export { AppTokenProvider, mintAppInstallationToken } from './github-app-token.ts';
 import { AppTokenProvider } from './github-app-token.ts';
@@ -53,6 +54,7 @@ import { assertInlineBody } from './page-body/page-shape.ts';
 import { OperationError } from './ops/contract.ts';
 import { isWriteThroughDisabled } from './write-through.ts';
 import { isSourceDbOnlySlug } from './persistence/source-storage.ts';
+import { neutralizeOutsideText } from './outside-content.ts';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -735,13 +737,7 @@ export function renderRepoCard(repo: string, data: RawRepo, syncedAt: string | n
     `private: ${data.private}`,
     ...(syncedAt === null ? [] : [`synced_at: ${yamlStr(syncedAt)}`]),
     '---',
-    '',
-    `# ${repo}`,
-    '',
-    data.description ?? '',
-    '',
-    `Default branch: ${data.default_branch}`,
-    '',
+    neutralizeOutsideText(['', `# ${repo}`, '', data.description ?? '', '', `Default branch: ${data.default_branch}`, ''].join('\n')),
   ].join('\n');
 }
 
@@ -853,7 +849,7 @@ export function renderItemPage(data: GitHubItemData, detailFetched = true, synce
     }
   }
 
-  return frontmatter.join('\n') + '\n' + body.join('\n') + '\n';
+  return frontmatter.join('\n') + '\n' + neutralizeOutsideText(body.join('\n')) + '\n';
 }
 
 /**
@@ -1018,7 +1014,7 @@ async function importPage(
     activePack,
   };
   const result = content === undefined ? await importFile(deps.engine, filePath, rel, opts)
-    : await importFromContent(deps.engine, slugifyPath(rel), content, { ...opts, sourcePath: rel, preserveGateMarkers: true });
+    : await importFromContent(deps.engine, slugifyPath(rel), content, { ...opts, sourcePath: rel, preserveGateMarkers: true, holdNoncanonicalPrivate: true });
   if (result.status === 'error' || result.error) {
     throw new Error(result.error ?? `Import failed for ${rel}`);
   }
@@ -1096,7 +1092,7 @@ export async function runGitHubSync(
   fetchImpl?: FetchImpl,
 ): Promise<import('../commands/sync.ts').SyncResult> {
   return withConnectorSync(engine, sourceId, 'github', cfg, opts,
-    (managed, options) => runGitHubSyncInner(engine, sourceId, cfg, options, managed, fetchImpl), pendingConnectorResult);
+    async (managed, options) => options.dryRun ? connectorDryRunResult('github', sourceId) : runGitHubSyncInner(engine, sourceId, cfg, options, managed, fetchImpl), pendingConnectorResult);
 }
 
 async function runGitHubSyncInner(engine: BrainEngine, sourceId: string, cfg: GitHubSourceConfig, opts: SyncOpts,
@@ -1244,7 +1240,15 @@ async function runGitHubSyncInner(engine: BrainEngine, sourceId: string, cfg: Gi
           // so they are re-fetched every sweep. Cost is bounded by the number
           // of open PRs, which is small in practice.
           const isOpenPr = item.kind === 'pr' && item.state === 'open';
-          const { fresh, hasDetail } = await storedPage(deps, filePath, item.updated_at);
+          // #9062: a stored page this read cannot load (one stored in segments over the single-string ceiling) fails this item, not the run.
+          let stored: Awaited<ReturnType<typeof storedPage>>;
+          try {
+            stored = await storedPage(deps, filePath, item.updated_at);
+          } catch (err) {
+            await itemFailed(repo, item, err, ' stored page read');
+            continue;
+          }
+          const { fresh, hasDetail } = stored;
           if (!opts.full && !isOpenPr && fresh && hasDetail) {
             // Cursor accounting: a fresh skip is a success too. Without this,
             // a repo whose newest item is always fresh stays re-listed on

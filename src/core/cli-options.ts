@@ -30,6 +30,8 @@ export interface CliOptions {
    * the reranker. Has no effect on other commands.
    */
   explain: boolean;
+  /** `--timings` on `gbrain search/query`: per-phase `timings_ms` and model-call `cost` (cli/search-timings.ts). */
+  timings?: boolean;
   /**
    * `--brain <id>` — which BRAIN (database) this invocation targets: 'host'
    * or a mount id from ~/.gbrain/mounts.json. Parsed here (stripped before
@@ -48,6 +50,18 @@ export interface CliOptions {
   writeWaitMs?: number | null;
   /** #5232: `--accept-pending` (true) / `--no-accept-pending` (false); unset = GBRAIN_ACCEPT_PENDING. */
   acceptPending?: boolean | null;
+  /**
+   * GBRA-218: `--as <member>` — preview an operation's reads as that member
+   * (src/cli/main.ts validates the member and sets the caller-access record).
+   * Unset when the flag is absent. `gbrain access` owns its own `--as`.
+   */
+  as?: string;
+  /**
+   * GBRA-498: `--room <list>` — the shared chat this answer goes to (member ids, group:<id>, guest). It never changes
+   * what is read: the result is marked for the room (src/cli/room.ts). A `--room` with no value is `''`, a declared
+   * room that could not be read, so every item is marked unknown instead of the flag being dropped. Unset when absent.
+   */
+  room?: string;
 }
 
 export const DEFAULT_CLI_OPTIONS: CliOptions = {
@@ -131,6 +145,9 @@ export const TIMEOUT_OWNING_COMMANDS = new Set(['sync', 'remote']);
  */
 export const EXPLAIN_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask', 'call']);
 
+/** Commands whose result formatter reads the global `--timings`; every other command gets the flag back in place. */
+export const TIMINGS_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask']);
+
 /**
  * #6625: command routes whose own parser reads `--wait` (a duration such as
  * `5m`, not the #5232 write wait in seconds). For these the global parser
@@ -151,7 +168,9 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
     | { plain: string }
     | { timeoutValue: string; equalsForm: boolean }
     | { explainFlag: true }
-    | { waitValue: string | undefined };
+    | { timingsFlag: true }
+    | { waitValue: string | undefined }
+    | { asValue: string };
   const slots: Slot[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -199,6 +218,10 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       slots.push({ timeoutValue: a.slice('--timeout='.length), equalsForm: true });
       continue;
     }
+    if (a === '--timings') {
+      slots.push({ timingsFlag: true });
+      continue;
+    }
     // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
     // #4541: like --timeout, whether the global parser claims it depends on
     // the command, which is only known after the full scan — slot it.
@@ -230,6 +253,20 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
     }
     if (a.startsWith('--wait=')) {
       slots.push({ waitValue: a.slice('--wait='.length) });
+      continue;
+    }
+    // GBRA-218: --as <member>. Slotted like --wait: `gbrain access check` owns its own --as list.
+    if (a === '--as' || a.startsWith('--as=')) {
+      const value = a === '--as' ? argv[++i] : a.slice('--as='.length);
+      if (value === undefined || value.length === 0 || value.startsWith('-')) throw new Error('--as requires a member id (gbrain access member list).');
+      slots.push({ asValue: value });
+      continue;
+    }
+    if (a === '--room' || a.startsWith('--room=')) {
+      const next = argv[i + 1];
+      if (a !== '--room') cliOpts.room = a.slice('--room='.length);
+      else if (next === undefined || next.startsWith('-')) cliOpts.room = '';
+      else { cliOpts.room = next; i++; }
       continue;
     }
     if (a === '--accept-pending' || a === '--no-accept-pending') {
@@ -303,6 +340,16 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       } else {
         deferredExplain.push('--explain');
       }
+      continue;
+    }
+    if ('timingsFlag' in s) {
+      if (commandSlot !== undefined && TIMINGS_CLAIMING_COMMANDS.has(commandSlot.plain)) cliOpts.timings = true;
+      else rest.push('--timings');
+      continue;
+    }
+    if ('asValue' in s) {
+      if (commandSlot?.plain === 'access') rest.push('--as', s.asValue);
+      else cliOpts.as = s.asValue;
       continue;
     }
     if ('waitValue' in s) {

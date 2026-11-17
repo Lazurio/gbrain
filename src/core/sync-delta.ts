@@ -32,8 +32,10 @@
  * That is the #1970 property this module preserves.
  */
 import { execFileSync } from './spawn.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
 import { buildSyncManifest, type SyncManifest } from './sync.ts';
 import { GIT_READ_ENV, gitChildEnv } from './git-env.ts';
+import { HARDENED_GIT_ARGS, NO_LAZY_FETCH_ENV } from './hardened-git.ts';
 import { classifyGitPathBytes, displayBytePath, type UnsupportedPathReason } from './sync-byte-paths.ts';
 
 /** Runs a git subcommand in `repoPath` and returns trimmed stdout (throws on failure). */
@@ -42,10 +44,12 @@ export type GitRunner = (repoPath: string, args: string[]) => string;
 // Mirrors `git()` + `buildGitInvocation()` in commands/sync.ts: `core.quotepath=false`
 // so non-ASCII (CJK) paths arrive as UTF-8; 30s timeout; 100 MiB maxBuffer (a
 // 100K-file `--name-status` diff tops out ~10-20 MiB — Node's 1 MiB default
-// would ENOBUFS-crash the sync with no log line).
+// would ENOBUFS-crash the sync with no log line). GST-2331: managed discovery reads through it, so it runs under
+// HARDENED_GIT_ARGS and NO_LAZY_FETCH_ENV; rename detection that needs a blob a partial clone lacks fails the diff
+// (`diff_failed`, the full tree walk) instead of fetching it.
 const DEFAULT_GIT_RUNNER: GitRunner = (repoPath, args) =>
-  execFileSync('git', ['-c', 'core.quotepath=false', '-C', repoPath, ...args], {
-    env: gitChildEnv(GIT_READ_ENV),
+  execFileSync('git', ['-c', 'core.quotepath=false', ...HARDENED_GIT_ARGS, '-C', repoPath, ...args], {
+    env: gitChildEnv({ ...GIT_READ_ENV, ...NO_LAZY_FETCH_ENV }),
     encoding: 'utf-8',
     timeout: 30_000,
     maxBuffer: 100 * 1024 * 1024,
@@ -160,11 +164,15 @@ export function computeSyncDelta(
   return { status: 'ok', manifest: detached ? mergeSyncManifests(manifest, detached) : manifest };
 }
 
-/** Runs a read-only git subcommand in `repoPath` and returns its stdout bytes untouched (throws on failure). */
-export type GitBytesRunner = (repoPath: string, args: string[]) => Buffer;
+/** Runs a read-only git subcommand in `repoPath` and returns its stdout bytes untouched (throws or rejects on failure). */
+export type GitBytesRunner = (repoPath: string, args: string[]) => Buffer | Promise<Buffer>;
 
-const DEFAULT_GIT_BYTES_RUNNER: GitBytesRunner = (repoPath, args) =>
-  execFileSync('git', ['-C', repoPath, ...args], { env: gitChildEnv(GIT_READ_ENV), timeout: 30_000, maxBuffer: 100 * 1024 * 1024 });
+/** GBRA-133 2b.3: async, so a classic sync a resident runs in-process never blocks its event loop on the diff or listing. */
+const DEFAULT_GIT_BYTES_RUNNER: GitBytesRunner = async (repoPath, args) => {
+  const r = await execFileBounded('git', ['-C', repoPath, ...args], { env: gitChildEnv(GIT_READ_ENV), timeout: 30_000, maxBuffer: 100 * 1024 * 1024, encoding: 'buffer' });
+  if (r.error) throw r.error;
+  return r.stdout;
+};
 
 let _gitBytesRunner: GitBytesRunner = DEFAULT_GIT_BYTES_RUNNER;
 
@@ -257,16 +265,16 @@ export function parseRawDiffZ(out: Buffer): LosslessDelta {
 }
 
 /** `computeSyncDelta` read as bytes (classic sync); the same anchor and diff ladder. */
-export function computeLosslessSyncDelta(repoPath: string, fromCommit: string, toCommit: string): LosslessDeltaResult {
+export async function computeLosslessSyncDelta(repoPath: string, fromCommit: string, toCommit: string): Promise<LosslessDeltaResult> {
   const run = _gitBytesRunner;
   try {
-    run(repoPath, ['cat-file', '-t', fromCommit]);
+    await run(repoPath, ['cat-file', '-t', fromCommit]);
   } catch {
     return { status: 'unavailable', reason: 'anchor_missing' };
   }
   let out: Buffer;
   try {
-    out = run(repoPath, ['diff', '--raw', '-z', '-M', `${fromCommit}..${toCommit}`]);
+    out = await run(repoPath, ['diff', '--raw', '-z', '-M', `${fromCommit}..${toCommit}`]);
   } catch {
     return { status: 'unavailable', reason: 'diff_failed' };
   }
@@ -274,10 +282,10 @@ export function computeLosslessSyncDelta(repoPath: string, fromCommit: string, t
 }
 
 /** `buildDetachedWorkingTreeManifest` read as bytes (classic sync): tracked changes against HEAD plus untracked files. */
-export function buildLosslessWorkingTreeManifest(repoPath: string): LosslessDelta {
+export async function buildLosslessWorkingTreeManifest(repoPath: string): Promise<LosslessDelta> {
   const run = _gitBytesRunner;
-  const delta = parseRawDiffZ(run(repoPath, ['diff', '--raw', '-z', '-M', 'HEAD']));
-  for (const raw of splitNul(run(repoPath, ['ls-files', '-z', '--others', '--exclude-standard']))) {
+  const delta = parseRawDiffZ(await run(repoPath, ['diff', '--raw', '-z', '-M', 'HEAD']));
+  for (const raw of splitNul(await run(repoPath, ['ls-files', '-z', '--others', '--exclude-standard']))) {
     if (raw.length === 0) continue;
     const parsed = classifyGitPathBytes(raw);
     if ('path' in parsed) delta.manifest.added.push(parsed.path);

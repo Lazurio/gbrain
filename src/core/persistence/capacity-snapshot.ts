@@ -23,10 +23,11 @@
  */
 import type { Notice } from '../agent-output.ts';
 import { principalKey, type Principal, type SqlEngine } from './model.ts';
-import { BACKGROUND_PRODUCERS, readBackgroundPauseShare } from './admission-origin.ts';
-import { readCapacityForecast } from './capacity-forecast.ts';
+import { BACKGROUND_PRODUCERS } from './admission-origin.ts';
+import { readCapacityConfig, readCapacityForecast } from './capacity-forecast.ts';
 import { CAPACITY_VERIFY } from './capacity-verify.ts';
 import { deadlineBoundEngine, deadlineFailure, engineCacheKey, withStatementDeadline } from '../statement-deadline.ts';
+import { engineKey } from '../engine-key.ts';
 
 export const CAPACITY_SNAPSHOT_TTL_MS = 60_000;
 export const CAPACITY_NOTICE_INTERVAL_MS = 60 * 60_000;
@@ -51,8 +52,8 @@ export interface CapacitySnapshot {
 }
 
 const snapshots = new WeakMap<object, { at: number; value: Promise<CapacitySnapshot> }>();
-const lowShownAt = new Map<string, number>();
-const pausedShown = new Set<string>();
+/** Per engine: when each scope|resource last showed `write_capacity_low`, and which are inside the pause. */
+let noticeState = new WeakMap<object, { lowShownAt: Map<string, number>; pausedShown: Set<string> }>();
 
 const UNKNOWN: CapacitySnapshot = { rows: [], low: [], paused: [], pause_pct: 0, status: 'unknown' };
 
@@ -68,8 +69,11 @@ export function cachedCapacitySnapshot(engine: SqlEngine, now: number = Date.now
   const bounded = deadlineBoundEngine(engine);
   const startedAt = Date.now();
   const fetch = withStatementDeadline({ startedAt, deadlineAt: startedAt + CAPACITY_FETCH_BOUND_MS, expired: false },
-    () => Promise.all([readCapacityForecast(bounded, { light: true }), readBackgroundPauseShare(bounded)]));
-  const value: Promise<CapacitySnapshot> = fetch.then(([forecast, share]): CapacitySnapshot => {
+    () => {
+      const config = readCapacityConfig(bounded);
+      return Promise.all([readCapacityForecast(bounded, { light: true, config }), config]);
+    });
+  const value: Promise<CapacitySnapshot> = fetch.then(([forecast, { pauseShare: share }]): CapacitySnapshot => {
     const attention = (row: typeof forecast.rows[number]): CapacityAttention => ({ scope: row.scope, resource: row.resource, used: row.used, limit: row.limit,
       pct: row.pct, days_to_exhaustion: row.days_to_exhaustion, config_key: row.config_key, recommended_limit: row.recommended_limit,
       command: `gbrain config set ${row.config_key} ${row.recommended_limit}` });
@@ -99,13 +103,17 @@ const describe = (row: CapacityAttention) => `${row.scope} ${row.resource} ${row
   + `${row.days_to_exhaustion !== null ? `, about ${row.days_to_exhaustion} day(s) left` : ''})`;
 const VERIFY = CAPACITY_VERIFY;
 
+/**
+ * GST-2107: this notice rides receipts, sync status and cycle output whatever the call did, so it says first that it is not a
+ * refusal and its fix is the read-only forecast; the cap raise stays in doctor's finding for the brain host's operator, never in
+ * the tail of a write an agent may read as a refusal.
+ */
 function lowNotice(rows: CapacityAttention[]): Notice {
-  const [first] = rows;
   return { code: 'write_capacity_low', kind: 'info',
-    why: `Write capacity is running low: ${rows.map(describe).join('; ')}. Writes still work; admission refuses at the cap. `
-      + `The brain host raises it with ${rows.map(row => row.command).join('; ')} (each covers about one more year; reversible).`,
-    fix: { argv: ['gbrain', 'config', 'set', first!.config_key, String(first!.recommended_limit)], consent: [], actor: 'host_admin', requires_exclusive: false,
-      why: 'Raises the cap that runs out first to a value that covers about one more year; undo with gbrain config unset.', verify: VERIFY,
+    why: `This notice is not a refusal: writes still work, and this call's own result says what it did. Write capacity is running low: ${rows.map(describe).join('; ')}; admission refuses only at the cap. `
+      + 'gbrain doctor --only persistence_capacity --json reads the forecast and the remedy for the brain host.',
+    fix: { argv: [...VERIFY.argv], mcp: VERIFY.mcp, consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'Reads which cap is running low, its forecast and the remedy, read-only; nothing needs to change for this call.', verify: VERIFY,
       docs: 'docs/guides/concurrent-writes.md#quota-near-exhaustion' } };
 }
 
@@ -122,7 +130,7 @@ function pausedNotice(rows: CapacityAttention[], pausePct: number): Notice {
 /**
  * The capacity notices one output carries. `throttle` (write and sync
  * receipts) shows `write_capacity_low` at most once an hour per process per
- * scope and resource; unthrottled (sync status, doctor, cycle output) shows it
+ * brain, scope and resource; unthrottled (sync status, doctor, cycle output) shows it
  * whenever a cap needs attention. The pause notice fires on each transition
  * into the pause, in either mode. `scopes` limits both to the scopes a
  * caller may see (a remote client: the brain and its own principal).
@@ -134,6 +142,10 @@ export async function capacityNotices(engine: SqlEngine, opts: { throttle: boole
   const snapshot = opts.snapshot ?? (opts.deadlineAt !== undefined ? await capacitySnapshotWithin(engine, opts.deadlineAt, now) : await cachedCapacitySnapshot(engine, now));
   if (snapshot.status === 'unknown') return [];
   const visible = (row: CapacityAttention) => !opts.scopes || opts.scopes.includes(row.scope);
+  const stateKey = engineKey(engine);
+  let state = noticeState.get(stateKey);
+  if (!state) noticeState.set(stateKey, state = { lowShownAt: new Map(), pausedShown: new Set() });
+  const { lowShownAt, pausedShown } = state;
   const notices: Notice[] = [];
   const candidates = snapshot.low.filter(visible);
   const low = opts.throttle ? candidates.filter(row => now - (lowShownAt.get(key(row)) ?? -Infinity) >= CAPACITY_NOTICE_INTERVAL_MS) : candidates;
@@ -152,8 +164,7 @@ export async function capacityNotices(engine: SqlEngine, opts: { throttle: boole
 }
 
 export function __resetCapacityNoticesForTests(): void {
-  lowShownAt.clear();
-  pausedShown.clear();
+  noticeState = new WeakMap();
 }
 
 /** #6696 (A4): a write receipt's capacity notices, throttled hourly per scope; a remote caller sees only the brain and its own principal. Never throws. */

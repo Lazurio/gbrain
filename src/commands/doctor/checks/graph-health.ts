@@ -13,7 +13,7 @@ import { quarantineFilterFragment } from '../../../core/quarantine.ts';
 import { entityTypePredicateSql, resolveEntityTypes } from '../../../core/schema-pack/entity-types.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../../../core/types.ts';
 import type { Check } from '../../doctor.ts';
-import { connectedEngine, type DoctorContext, type DoctorEntry, doctorHealth } from '../context.ts';
+import { connectedEngine, type DoctorContext, type DoctorEntry, doctorHealth, doctorSourceIds } from '../context.ts';
 import { agentFix, brainScorePlanFix, checkError } from '../check-fix.ts';
 import { ORPHAN_FULL_SCAN_KEY, countLivePages, estimateOrphanRatio, orphanFullScanMaxPages, type OrphanEstimate } from './orphan-estimate.ts';
 
@@ -253,6 +253,12 @@ function estimatedOrphanRatioCheck(est: OrphanEstimate, cutoff: number, srcId: s
   const pct = (est.ratio * 100).toFixed(0);
   const deep = ['gbrain', 'doctor', '--tier', 'deep', '--only', 'orphan_ratio', ...(srcId ? ['--source', srcId] : []), '--json'];
   const details = { exact: false, estimated: true, ...est, full_scan_max_pages: cutoff, config_key: ORPHAN_FULL_SCAN_KEY, exact_command: deep.join(' ') };
+  // #7145: a sample with no linkable page estimated nothing; 0/0 is not 0%.
+  if (est.sample_linkable === 0) {
+    return { name: 'orphan_ratio', status: 'warn', details: { ...details, health: 'unknown', reason: 'empty_sample' },
+      message: `Orphan ratio unknown${srcId ? ` in source '${srcId}'` : ''}: the ${est.sample_pages}-page sample of ${est.live_pages} live pages held no linkable page. Exact figure: ${deep.join(' ')}.`,
+      fix: agentFix(deep, 'Read-only: the exact orphan ratio from the full scan.', 'orphan_ratio') };
+  }
   const message = `Orphan ratio about ${pct}%${srcId ? ` in source '${srcId}'` : ''} (estimated: ${est.sample_orphans}/${est.sample_linkable} linkable pages in a `
     + `${est.sample_pages}-page sample of ${est.live_pages} live pages; the full scan runs above ${cutoff} pages only with --tier deep: ${deep.join(' ')}).`;
   if (est.ratio <= 0.5) return { name: 'orphan_ratio', status: 'ok', message, details };
@@ -299,29 +305,64 @@ export const staleMentionsEntry: DoctorEntry = {
 };
 
 async function runTimelineHistory(ctx: DoctorContext): Promise<Check[]> {
-  const { orphanRatioSourceId, progress } = ctx;
+  const { orphanRatioSourceId, progress, only } = ctx;
   const engine = connectedEngine(ctx);
   const checks: Check[] = [];
 
   // 9d. Wave 2 residual-state signals (#5567, #5525): database-only timeline
   // rows and derived pages without explicit visibility. Bounded, never throw.
+  // #7343: under --only, run just the named checks of this entry.
   progress.heartbeat('timeline_history');
   {
-    const { timelineHistoryCheck } = await import('./timeline-history.ts');
-    const { derivedVisibilityCheck } = await import('./derived-visibility.ts');
-    checks.push(await timelineHistoryCheck(engine, orphanRatioSourceId), await derivedVisibilityCheck(engine, orphanRatioSourceId));
+    if (!only || only.has('timeline_history')) {
+      const { timelineHistoryCheck } = await import('./timeline-history.ts');
+      checks.push(await timelineHistoryCheck(engine, orphanRatioSourceId));
+    }
     // Wave checks registered in doctor/wave-checks.ts rather than inline here.
     const { runWaveChecks } = await import('../wave-checks.ts');
-    for (const finding of await runWaveChecks(engine, { only: 'wave', sourceIds: orphanRatioSourceId ? [orphanRatioSourceId] : undefined })) checks.push(finding.check);
+    for (const finding of await runWaveChecks(engine, { only: 'wave', ids: only ?? undefined, sourceIds: doctorSourceIds(ctx) })) checks.push(finding.check);
   }
   return checks;
 }
+
+/** #7276: the privacy check is its own entry, run before the full scans, so its answer never waits on the wave checks' budget. */
+async function runDerivedVisibility(ctx: DoctorContext): Promise<Check[]> {
+  ctx.progress.heartbeat('derived_visibility');
+  const { derivedVisibilityCheck } = await import('./derived-visibility.ts');
+  const checks: Check[] = [];
+  checks.push(await derivedVisibilityCheck(connectedEngine(ctx), ctx.orphanRatioSourceId));
+  return checks;
+}
+
+export const derivedVisibilityEntry: DoctorEntry = {
+  name: 'derived_visibility',
+  emits: ['derived_visibility'],
+  run: runDerivedVisibility,
+};
+
+/**
+ * GST-1209 follow-up: damaged segmented pages are their own entry with their own budget, so a default run reports the
+ * finding even when the wave checks of timeline_history run out of theirs (and never serves an older entry's last known result for it).
+ */
+async function runSegmentedTiling(ctx: DoctorContext): Promise<Check[]> {
+  ctx.progress.heartbeat('segmented_tiling');
+  const { segmentedTilingCheck } = await import('./segmented-tiling.ts');
+  const checks: Check[] = [];
+  checks.push(await segmentedTilingCheck(connectedEngine(ctx), ctx.orphanRatioSourceId ? [ctx.orphanRatioSourceId] : undefined));
+  return checks;
+}
+
+export const segmentedTilingEntry: DoctorEntry = {
+  name: 'segmented_tiling',
+  emits: ['segmented_tiling'],
+  run: runSegmentedTiling,
+};
 
 export const timelineHistoryEntry: DoctorEntry = {
   name: 'timeline_history',
   emits: [
     'timeline_history',
-    'derived_visibility',
+    'privacy_label_ignored',
     'safe_index_pending',
     'credential_projection_pending',
     'connector_checkpoints',
@@ -333,10 +374,13 @@ export const timelineHistoryEntry: DoctorEntry = {
     'connector_held_items',
     'git_held_files',
     'frontmatter_hook',
+    'url_source_origin',
     'orphan_persistence_bindings',
     'foreign_ownership_marker',
     'coordination_lock_location',
     'unbound_source',
+    'dream_write_deferred',
+    'embedding_restamp_stalled',
     'writer_version',
     'segmented_storage',
     'self_capture',
@@ -345,11 +389,21 @@ export const timelineHistoryEntry: DoctorEntry = {
     'stale_embedding_effects',
     'google_file_modes',
     'google_calendar_readable',
+    'google_api_access',
     'atom_retirements_restorable',
+    'atom_fence_rows',
+    'generation_retirements',
+    'generation_held',
+    'generation_pending',
     'extractor_facts_expired',
+    'unwithdrawn_facts',
+    'purged_page_facts',
     'conversation_label_facts',
     'conversation_outcomes_stale',
     'captured_facts_active',
+    'agent_session_facts',
+    'facts_redaction_marker',
+    'fact_bulk_dates',
     'loop_facts_drift',
     'ontology_facts_fenced',
     'stale_frontmatter_keys',

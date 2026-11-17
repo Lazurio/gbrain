@@ -11,9 +11,14 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { performSync } from '../src/commands/sync.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { readWriterDiagnostics } from '../src/core/persistence/diagnostics.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { submitRememberMutation } from '../src/core/persistence/memory-mutations.ts';
 import { lostCallerWrites, replayImportedRemembers } from '../src/core/repair/failed-writes.ts';
+import { pendingImportRefusal } from '../src/core/persistence/pending-import.ts';
+import { readDrainHolder, withDrainLease } from '../src/core/persistence/sync-lease.ts';
+import { PENDING_IMPORT_MESSAGE, runMemoryWrite, writeFailureDiagnostic } from '../src/core/persistence/verb-errors.ts';
+import type { SyncResult } from '../src/commands/sync.ts';
 import { managedBrain } from './helpers/managed-brain.ts';
 import { durableGitRepo, git } from './helpers/git-publication.ts';
 
@@ -107,10 +112,29 @@ describe('#6693 remember onto a page whose file awaits import', () => {
     expect(error.code).toBe('source_changed');
     expect(error.reason).toBeUndefined();
     expect(error.message).toBe('The canonical file contains an uncoordinated local edit.');
-    expect((await lastReceipt(engine, 'remember')).error_detail).toBeNull();
+    expect((await lastReceipt(engine, 'remember')).error_detail?.origin).toBe('file_database_drift');
     git(root, 'add', '--', `${slug}.md`); git(root, 'commit', '-q', '-m', 'commit the hand edit later');
     expect((await sync(engine, root)).replayedRemembers).toBeUndefined();
     expect(await claims(engine)).toEqual([]);
+  }, { setup }), 120_000);
+
+  test('GST-1601: a put_page onto an uncoordinated local edit, or onto a path an unindexed file occupies, records the cause on its receipt', () => managedBrain(async ({ engine, ctx, root }) => {
+    await seed(ctx);
+    edit(root, 'A hand edit nobody committed.');
+    const revision = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!.revision;
+    const drift = await refused(() => submitPageMutation(ctx, { operation: 'put_page', params: { slug, request_id: randomUUID(), expected_revision: revision,
+      content: '---\ntype: person\ntitle: Owner\n---\n\nReplaced body.\n' } }));
+    expect(drift.code).toBe('source_changed');
+    expect((await lastReceipt(engine, 'put_page')).error_detail?.origin).toBe('file_database_drift');
+    writeFileSync(join(root, 'people', 'unindexed-example.md'), '---\ntype: person\ntitle: Unindexed\n---\n\nNever imported.\n');
+    const occupied = await refused(() => submitPageMutation(ctx, { operation: 'put_page', params: { slug: 'people/unindexed-example', request_id: randomUUID(),
+      content: '---\ntype: person\ntitle: Unindexed\n---\n\nNew page.\n' } }));
+    expect(occupied.code).toBe('source_changed');
+    expect((await lastReceipt(engine, 'put_page')).error_detail?.origin).toBe('canonical_path_occupied');
+    expect(readFileSync(file(root), 'utf8')).toContain('A hand edit nobody committed.');
+    expect(readFileSync(join(root, 'people', 'unindexed-example.md'), 'utf8')).toContain('Never imported.');
+    // Routine drift refusals keep out of writer status's recent database refusals.
+    expect((await readWriterDiagnostics(engine)).recent_failures.map(row => row.error_detail?.origin)).not.toContain('file_database_drift');
   }, { setup }), 120_000);
 
   test('a put_page refused the same way is classified but not replayed', () => managedBrain(async ({ engine, ctx, root }) => {
@@ -121,10 +145,36 @@ describe('#6693 remember onto a page whose file awaits import', () => {
     const error = await refused(() => submitPageMutation(ctx, { operation: 'put_page', params: { slug, request_id: randomUUID(), expected_revision: revision,
       content: '---\ntype: person\ntitle: Owner\n---\n\nReplaced body.\n' } }));
     expect(error.reason).toBe('pending_import');
-    expect(error.fix?.argv).toEqual(['gbrain', 'sync', '--source', 'default', '--no-pull', '--json']);
+    expect(error.fix?.argv).toEqual(['gbrain', 'sync', 'status', '--source', 'default', '--json']);
     expect((await lastReceipt(engine, 'put_page')).error_detail?.origin).toBe('pending_import');
     expect((await sync(engine, root)).replayedRemembers).toBeUndefined();
     expect(readFileSync(file(root), 'utf8')).toContain('Committed by another agent.');
     expect(readFileSync(file(root), 'utf8')).not.toContain('Replaced body.');
+  }, { setup }), 120_000);
+  // GBRA-133: an agent followed a refusal that named `gbrain sync --source <source> --no-pull` while serve was running and put a
+  // second sync owner beside it. With a serve holding the source's drain lease, no pending-import surface names a sync to start.
+  test('while a serve owns the source, no pending-import refusal tells the caller to start a sync', () => managedBrain(async ({ engine, ctx, root }) => {
+    await seed(ctx);
+    edit(root, 'The cron writer committed this line.');
+    git(root, 'add', '--', `${slug}.md`); git(root, 'commit', '-q', '-m', 'cron writer commit');
+    const revision = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!.revision;
+    const startsSync = (surface: unknown) => JSON.stringify(surface).match(/gbrain sync(?! status)\b|"gbrain","sync","(?!status")/g) ?? [];
+    const view = (error: unknown) => { const e = error as { message?: string; suggestion?: string; why?: string; fix?: unknown; reason?: string; detail?: string };
+      return { message: e.message, suggestion: e.suggestion, why: e.why, fix: e.fix }; };
+    await withDrainLease(engine, 'default', { holder: { kind: 'serve', id: 'serve-example' } }, async () => {
+      expect((await readDrainHolder(engine, 'default'))?.kind).toBe('serve');
+      const remember = { fact: 'Owner prefers written updates', entity: slug, provenance: 'test', visibility: 'world' as const };
+      const cli = await refused(() => runMemoryWrite(() => submitRememberMutation(ctx, remember))) as { detail?: string; fix?: { argv?: string[] } };
+      expect(cli.detail).toBe('pending_import');
+      expect(cli.fix?.argv).toEqual(['gbrain', 'sync', 'status', '--source', 'default', '--json']);
+      const direct = await refused(() => submitRememberMutation(ctx, remember));
+      const put = await refused(() => submitPageMutation(ctx, { operation: 'put_page', params: { slug, request_id: randomUUID(), expected_revision: revision,
+        content: '---\ntype: person\ntitle: Owner\n---\n\nReplaced body.\n' } }));
+      expect([direct.reason, put.reason]).toEqual(['pending_import', 'pending_import']);
+      const surfaces = [view(cli), view(direct), view(put), writeFailureDiagnostic('source_changed', PENDING_IMPORT_MESSAGE),
+        ...[false, true].flatMap(remote => ['remember', 'put_page'].map(operation => view(pendingImportRefusal({ source_id: 'default', slug, operation }, remote))))];
+      for (const surface of surfaces) expect(startsSync(surface)).toEqual([]);
+      return {} as SyncResult;
+    });
   }, { setup }), 120_000);
 });

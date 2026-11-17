@@ -29,10 +29,16 @@ import {
 // history + scrollback. This helper is the single source of truth so the
 // two surfaces can't drift again. Match on word-segments to avoid
 // false-positives (e.g. `monkey` doesn't match `key`).
+// #8920: plurals (apiKeys, tokens), acronyms (APIKey, apikey) and credential, authorization and passphrase match too,
+// except after a count word (max_tokens, max_output_tokens, budget_tokens, max_pending_per_credential), which names
+// a limit rather than a secret.
+const SECRET_WORD = /^(key|secret|token|password|pwd|passwd|auth)$/;
+const SECRET_WORD_8920 = /^(keys|secrets|tokens|passwords|credentials?|authorization|passphrases?|apikeys?)$/;
+const COUNT_WORDS = new Set(['max', 'min', 'budget', 'limit', 'avg', 'total', 'count', 'num', 'input', 'output', 'prompt', 'context', 'completion', 'reasoning', 'per']);
 export function isSensitiveConfigKey(key: string): boolean {
-  const lower = key.toLowerCase();
-  // Word-boundary matches: foo_key, foo.key, key_foo, key, api_key, ...
-  return /(^|[._-])(key|secret|token|password|pwd|passwd|auth)([._-]|$)/.test(lower);
+  const words = key.replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().split(/[._-]+/);
+  // Whole-word matches: foo_key, foo.key, key_foo, key, api_key, secretAccessKey, ...
+  return words.some((word, i) => SECRET_WORD.test(word) || (SECRET_WORD_8920.test(word) && !words.slice(0, i).some(w => COUNT_WORDS.has(w))));
 }
 
 /**
@@ -68,6 +74,7 @@ const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
   'persistence.write_wait_ms',
   // Engine graduation opt-out: the pre-connect migrate router reads it engine-free.
   'migrate.graduation', 'doctor.default_budget_ms', // #6803: the CLI doctor reads it pre-connect (commands/doctor/default-budget.ts)
+  'minions.terminal_hook', // #7242: a command the worker runs; local file plane only, never the shared DB plane (minions/terminal-hook.ts)
 ]);
 
 /** #5489: every self_upgrade.* reader (cli.ts startup check, autopilot,
@@ -76,9 +83,11 @@ const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
  * never written to a DB row nothing reads. */
 const SELF_UPGRADE_KEY_PREFIX = 'self_upgrade.';
 
+/** GBRA-377: skills.resolver.* are file-plane only, set|unset|get before any engine (logic in core/setup/skill-resolver-config.ts). */
+const runSkillResolverKey = async (args: string[]) => (await import('../core/setup/skill-resolver-config.ts')).runSkillResolverConfigKey(args, (await import('../core/config.ts')).configDir());
 /** The single membership test the get/set/unset lanes share. */
 function isFilePlaneDottedKey(key: string): boolean {
-  return FILE_PLANE_DOTTED_KEYS.has(key) || key.startsWith(SELF_UPGRADE_KEY_PREFIX) || isConsentConfigKey(key);
+  return FILE_PLANE_DOTTED_KEYS.has(key) || key.startsWith(SELF_UPGRADE_KEY_PREFIX) || key.startsWith('skills.resolver.') || isConsentConfigKey(key);
 }
 
 /** Delete the DB-plane row of a file-plane key: a `config set` from before
@@ -109,7 +118,7 @@ async function unsetFilePlaneKey(key: string): Promise<boolean> {
   const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
   const cfg = loadConfigFileOnly();
   const dot = key.indexOf('.');
-  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate' | 'doctor';
+  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate' | 'doctor' | 'minions';
   const leaf = key.slice(dot + 1);
   const branch = cfg?.[top] as Record<string, unknown> | undefined;
   if (!cfg || !branch || !(leaf in branch)) return false;
@@ -277,7 +286,16 @@ export function redactConfigValue(key: string, value: string): string {
   // canonical single home (drops the whole userinfo, both schemes).
   if (/postgres(ql)?:\/\//.test(value)) return redactPgUrl(value);
   if (isSensitiveConfigKey(key)) return '***';
-  return value;
+  // #8920: userinfo (user:pass@) in a URL of any other scheme; an `@` after the host (a path, query or fragment) is not userinfo.
+  return value.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/?#\s]*@/gi, '$1***@');
+}
+
+/** An object config value with every sensitive field masked at any depth (#7346: storage.secretAccessKey). */
+function redactNestedConfig(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactNestedConfig);
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k,
+    typeof v === 'string' ? redactConfigValue(k, v) : v !== null && v !== undefined && isSensitiveConfigKey(k) ? '***' : redactNestedConfig(v)]));
 }
 
 // #3661: the flags `config set` actually honors. Everything else that looks
@@ -360,6 +378,7 @@ export async function handleDbPlaneRoutedKeys(key: string, value: string): Promi
  * to change when the engine can't connect. Returns true when handled.
  */
 export async function tryRunConfigEngineFree(args: string[]): Promise<boolean> {
+  if (args[1]?.startsWith('skills.resolver.')) return runSkillResolverKey(args);
   if (args[0] !== 'set') return false;
   const key = args[1];
   const value = args.slice(2).find((a) => !a.startsWith('-'));
@@ -379,12 +398,19 @@ const setLineGrammarConfig = async (engine: BrainEngine, key: string, value: str
 
 async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value: string, force = false): Promise<void> {
   if (await setLineGrammarConfig(engine, key, value)) return;
+  if (key === 'sync.admission') return (await import('./config/sync-admission-value.ts')).setSyncAdmissionValue(engine, value);
+  if (key === 'sync.metafile_pages') return (await import('./config/sync-metafile-pages-value.ts')).setMetafilePagesValue(engine, value);
+  if (/^sync\.(max_delete(s|_ratio)|apply_held_deletions)(\.source\..+)?$/.test(key) || key === 'purge.retention_hours') {
+    const err = (await import('../core/sync-reconcile.ts')).deleteSafetyConfigRefusal(key, value);
+    if (err) { console.error(`[config] ${err}`); process.exit(1); }
+  }
   if (key.startsWith('decide.')) {
     const { validateDecideConfigValue } = await import('../core/ai/decide/config.ts');
     const err = validateDecideConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
   (await import('./config/enumerated-keys.ts')).refuseUnregisteredEnumeratedKey(key, force);
+  if (key.startsWith('generations.')) await (await import('./config/generations-values.ts')).refuseGenerationsValue(key, value);
   const searchRefusal = key.startsWith('search.') ? (await import('../core/search/config-values.ts')).searchConfigValueRefusal(key, value) : null;
   if (searchRefusal) {
     const { exitCliError, usageError } = await import('../cli/cli-error.ts');
@@ -398,8 +424,12 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
   if (key.startsWith('loops.')) (await import('./config/loops-values.ts')).refuseInvalidLoopsConfigValue(key, value);
+  if (key === 'dream.claim_conflicts.mode') { const err = (await import('../core/facts/claim-conflicts.ts')).claimConflictsModeRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key.startsWith('recall.')) { const err = (await import('../core/facts/recall-config.ts')).recallConfigValueRefusal(key, value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key === 'sync.slug_conflicts.auto_remove') { const err = (await import('../core/repair/slug-autoheal.ts')).slugAutoRemoveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key === 'sync.origin_twins.auto_resolve') { const err = (await import('../core/repair/origin-twins-heal.ts')).originAutoResolveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'sync.repo_path') { const err = (await import('../core/sync-config-keys.ts')).syncRepoPathRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'cycle.purge.mcp_request_log_retention_days') { const err = (await import('../core/mcp-request-log-retention.ts')).mcpLogRetentionRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key.startsWith('search.')) (await import('./config/keyword-timeout-value.ts')).refuseInvalidKeywordTimeoutValue(key, value);
   if (key === 'persistence.max_claim_ms') {
     const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
@@ -550,6 +580,7 @@ async function setFilePlaneKey(key: string, value: string, tail: string[]): Prom
     saveConfig(cfg);
     console.log(`Set ${key} = ${on} (file plane: ~/.gbrain/config.json)`);
   } else if (key === 'persistence.write_wait_ms') { await setFileWriteWait(cfg, value, saveConfig);
+  } else if (key === 'minions.terminal_hook') { (await import('../core/minions/terminal-hook.ts')).setTerminalHookConfig(cfg, value, saveConfig);
   } else if (key === 'doctor.default_budget_ms') { (await import('./doctor/default-budget.ts')).setDoctorDefaultBudget(cfg, value, saveConfig);
   } else if (key === 'migrate.graduation') {
     const on = isConfigTruthy(value);
@@ -611,6 +642,7 @@ async function setFilePlaneKey(key: string, value: string, tail: string[]): Prom
  * refusal. Returns true when handled.
  */
 export async function tryRunConfigThinClient(args: string[]): Promise<boolean> {
+  if (args[1]?.startsWith('skills.resolver.')) return runSkillResolverKey(args);
   const [action, key, ...rest] = args;
   if (!key || !key.startsWith(SELF_UPGRADE_KEY_PREFIX) || rest.some((a) => a.startsWith('-'))) return false;
   if (action === 'set' && rest.length === 1) {
@@ -665,7 +697,7 @@ async function showConfig(engine: BrainEngine): Promise<void> {
     const display = typeof v === 'string'
       ? redactConfigValue(k, v)
       : v !== null && typeof v === 'object'
-        ? (isSensitiveConfigKey(k) ? '***' : JSON.stringify(v))
+        ? (isSensitiveConfigKey(k) ? '***' : JSON.stringify(redactNestedConfig(v)))
         : v;
     console.log(`  ${k}: ${display}`);
   }
@@ -905,6 +937,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // the runtime does — env/file plane wins over DB (loadConfig() already
     // overlays env onto the file) — and report which plane answered on
     // stderr, keeping stdout a bare value for scripts.
+    if (key === 'mcp.publish_wakeshift') return (await import('./wakeshift.ts')).printWakeshiftGate();
     const filePlane = loadConfig() as Record<string, unknown> | null;
     // Dotted keys (push.allow_unverified_remote, hooks.stop_push_debounce_min)
     // are stored NESTED by `set`; resolve the path so `get`/`unset` see them.
@@ -934,10 +967,11 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       : fileOnly
         ? fileVal
         : (fileVal !== undefined && fileVal !== null ? fileVal : dbVal);
+    if (key === 'memory.agent_writeback' && (val === null || val === undefined)) return (await import('./config-agent-writeback.ts')).printUnsetAgentWriteback(engine);
     if (val !== null && val !== undefined) {
       // #3943: redact by default like `show`/`set` — `get` output lands in
       // agent transcripts and shell history; scripts opt out with the flag.
-      const out = typeof val === 'string' ? val : JSON.stringify(val);
+      const out = typeof val === 'string' ? val : JSON.stringify(rawFlag ? val : redactNestedConfig(val));
       console.log(rawFlag ? out : redactConfigValue(key, out));
       if (dbAuthoritative) {
         console.error(`[config] source: ${dbVal !== null && dbVal !== undefined ? 'db plane (authoritative for this key)' : 'file mirror (no DB row)'}${await writebackLanesNote(engine, key)}`);
@@ -998,10 +1032,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // Ambient-writeback keys DUAL-WRITE (OV2-5): file mirror first (the
     // engine-free readers' plane), then the authoritative DB row. A DB
     // failure leaves the planes briefly diverged — reported, not hidden.
-    if (key === EMBEDDING_DISABLED_KEY) {
-      await setEmbeddingDisabled(engine, value);
-      return;
-    }
+    if (key === EMBEDDING_DISABLED_KEY) return setEmbeddingDisabled(engine, value);
     if (key === BRAIN_AUDIENCE_KEY) {
       // Dual-plane like memory.* (WP8): the engine-free harness lane gates
       // its enable-nudge advisory on the file-plane declared audience.
@@ -1033,6 +1064,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       console.log(`Set ${key} = ${audience} (${hostPlane ? 'file + db planes' : 'db plane only — mounted brain'})`);
       return;
     }
+    if (key === 'memory.agent_writeback') return (await import('./config-agent-writeback.ts')).setAgentWritebackFromCli(engine, value);
     if (MEMORY_DUAL_PLANE_KEYS.has(key)) {
       const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
       const cfg = (loadConfigFileOnly() ?? { engine: 'pglite' }) as Parameters<typeof saveConfig>[0];
@@ -1215,8 +1247,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     if (key.startsWith('provider_chat_options.')) await import('../core/config-db-merge.ts').then(m => m.assertProviderChatOptionsSetValue(key, value)).catch((error: Error) => { console.error(`[config] ${error.message}`); process.exit(1); });
     // #5470: every admission parses the journal caps; a malformed value
     // would refuse all managed writes, so reject it here.
-    const { JOURNAL_CONFIG_KEYS, parseJournalConfigValue } = await import('../core/persistence/limits.ts');
-    if (JOURNAL_CONFIG_KEYS.includes(key)) {
+    const { JOURNAL_CONFIG_KEYS, UPLOAD_CONFIG_KEYS, parseJournalConfigValue } = await import('../core/persistence/limits.ts');
+    if (JOURNAL_CONFIG_KEYS.includes(key) || UPLOAD_CONFIG_KEYS.includes(key)) {
       try { parseJournalConfigValue(key, value); }
       catch (error) { console.error(`[config] ${(error as Error).message}`); process.exit(1); }
     }
@@ -1459,8 +1491,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
           newMode: value,
           engine,
           isTty: Boolean(process.stdout.isTTY && process.stdin.isTTY),
-          // CLI doesn't thread --yes here today; reserved for /ship-style
-          // automation paths that can opt into auto-submit.
+          // CLI doesn't thread --yes here today; --yes would skip the
+          // prompt and print the preview command (it never spends).
           yesFlag: false,
         });
       } catch (err) {
@@ -1510,5 +1542,5 @@ async function refuseSchemaSizingKey(key: 'embedding_model' | 'embedding_dimensi
 async function writebackLanesNote(engine: BrainEngine, key: string): Promise<string> {
   if (key !== 'memory.auto_writeback') return '';
   const { captureLaneSummary, resolveWritebackConfig } = await import('../core/facts/writeback-config.ts');
-  return `; capture lanes: ${captureLaneSummary(await resolveWritebackConfig(engine, loadConfig(), { gate: true }))}`;
+  return `; capture lanes: ${captureLaneSummary(await resolveWritebackConfig(engine, loadConfig(), { gate: true }))}${await (await import('./config-agent-writeback.ts')).agentWritebackNote(engine)}`;
 }

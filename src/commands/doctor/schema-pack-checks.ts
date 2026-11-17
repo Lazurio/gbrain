@@ -6,11 +6,12 @@
 import type { BrainEngine } from '../../core/engine.ts';
 import type { Check } from '../doctor.ts';
 import type { MisroutedResult } from '../../core/multi-source-drift.ts';
+import { boundUnknownDetails } from './bounded-unknown.ts';
 import { statSync } from 'node:fs';
 import { redactConnectionInfo } from '../../core/audit/redact-connection-info.ts';
 import { formatPackBytes, OVERSIZED_PACK_RUNBOOK, schemaPackMaxBytes } from '../../core/schema-pack/loader.ts';
 import { loadActivePackForLocalEngine } from '../../core/schema-pack/best-effort.ts';
-import { sanitizeTypeForDisplay, storedTypeMissesPack } from '../../core/schema-pack/type-usage.ts';
+import { WRITER_OWNED_PAGE_SQL, sanitizeTypeForDisplay, storedTypeMissesPack } from '../../core/schema-pack/type-usage.ts';
 
 // =================================================================
 // v0.39 T7 + T9 — schema-pack doctor checks
@@ -103,7 +104,8 @@ interface SourceConformance {
  * #5879: pages match the active pack only when their stored type is a
  * declared page type or an alias of one (`storedTypeMissesPack`, the same
  * classification as `schema lint --with-db`). Each source is graded against
- * its own resolved pack. Any undeclared type warns; untyped pages warn at
+ * its own resolved pack. Any undeclared type warns, except on pages gbrain's
+ * own writers wrote (`WRITER_OWNED_PAGE_SQL`, #8815); untyped pages warn at
  * >= 10% of a source.
  */
 export async function checkSchemaPackConsistency(
@@ -111,14 +113,14 @@ export async function checkSchemaPackConsistency(
   opts: { sourceIds?: string[] } = {},
 ): Promise<Check> {
   const scoped = opts.sourceIds !== undefined;
-  let rows: Array<{ src: string; type: string | null; n: string }>;
+  let rows: Array<{ src: string; type: string | null; own: boolean; n: string }>;
   try {
     rows = await engine.executeRaw(
-      `SELECT COALESCE(source_id, 'default') AS src, type, COUNT(*)::text AS n
-         FROM pages
-        WHERE deleted_at IS NULL${scoped ? ' AND source_id = ANY($1::text[])' : ''}
-        GROUP BY source_id, type
-        ORDER BY source_id`,
+      `SELECT COALESCE(p.source_id, 'default') AS src, p.type, ${WRITER_OWNED_PAGE_SQL} AS own, COUNT(*)::text AS n
+         FROM pages p
+        WHERE p.deleted_at IS NULL${scoped ? ' AND p.source_id = ANY($1::text[])' : ''}
+        GROUP BY p.source_id, p.type, own
+        ORDER BY p.source_id`,
       scoped ? [opts.sourceIds] : [],
     );
   } catch (e) {
@@ -127,10 +129,10 @@ export async function checkSchemaPackConsistency(
   if (rows.length === 0) {
     return { name: 'schema_pack_consistency', status: 'ok', message: 'No pages in any source — schema consistency N/A.' };
   }
-  const bySource = new Map<string, Array<{ type: string | null; n: number }>>();
+  const bySource = new Map<string, Array<{ type: string | null; own: boolean; n: number }>>();
   for (const r of rows) {
     const list = bySource.get(r.src) ?? [];
-    list.push({ type: r.type, n: Number(r.n) });
+    list.push({ type: r.type, own: r.own === true, n: Number(r.n) });
     bySource.set(r.src, list);
   }
   const graded: SourceConformance[] = [];
@@ -139,7 +141,7 @@ export async function checkSchemaPackConsistency(
     const pack = await loadActivePackForLocalEngine(engine, { sourceId: src });
     if (!pack) { unresolved.push(src); continue; }
     const undeclaredTypes = types
-      .filter((t): t is { type: string; n: number } => !!t.type && storedTypeMissesPack(t.type, pack.manifest))
+      .filter((t): t is { type: string; own: boolean; n: number } => !!t.type && !t.own && storedTypeMissesPack(t.type, pack.manifest))
       .map((t) => ({ type: t.type, count: t.n }))
       .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
     graded.push({
@@ -291,15 +293,24 @@ export function multiSourceDriftCheck(
       `. Fix the path or permissions (\`gbrain sources status\`), then re-run \`gbrain doctor\`.`
     : '';
   if (result.walk_truncated) {
+    // #7145: a walk stopped at its bound did not compare every file, so drift is unknown, not detected and not clear;
+    // slugs already found before the bound are a floor, kept so the bound does not hide them.
+    const bound = result.truncated_by === 'time' ? 'time' : 'files';
+    const which = bound === 'files'
+      ? `its file limit (${result.limit} files per source, GBRAIN_DRIFT_LIMIT)`
+      : `its time limit (${result.timeout_ms} ms, GBRAIN_DRIFT_TIMEOUT_MS)`;
+    const found = result.count > 0
+      ? ` At least ${result.count} misrouted slug(s) were already found before it stopped (e.g., ${result.sample.map((s) => `${s.slug} (intended=${s.intended_source})`).join(', ')}).`
+      : '';
     return {
       name: 'multi_source_drift',
       status: 'warn',
       message:
-        `Multi-source drift not verified — the FS walk hit its bound (${result.limit} files / ${result.timeout_ms} ms)` +
-        (host === 'remote' ? ' on the brain server' : '') +
-        `. Re-run with a larger bound: \`GBRAIN_DRIFT_LIMIT=<files> GBRAIN_DRIFT_TIMEOUT_MS=<ms> gbrain doctor\`.` +
+        `Multi-source drift unknown: the FS walk stopped at ${which}` + (host === 'remote' ? ' on the brain server' : '') +
+        ` before comparing every file, so health is unknown, not clear (bounds: ${result.limit} files / ${result.timeout_ms} ms).${found}` +
+        ` Re-run with a larger bound: \`GBRAIN_DRIFT_LIMIT=<files> GBRAIN_DRIFT_TIMEOUT_MS=<ms> gbrain doctor --only multi_source_drift\`.` +
         unreadableNote,
-      details: { ...details, code: 'not_verified', verified: false },
+      details: { ...details, ...boundUnknownDetails(bound), code: 'not_verified', verified: false, drift_found_so_far: result.count },
     };
   }
   if (result.count > 0) {

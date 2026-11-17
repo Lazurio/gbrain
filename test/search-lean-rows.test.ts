@@ -24,6 +24,7 @@ import { allowedOpNames, createStdioSurfaceState } from '../src/mcp/surface.ts';
 import { stampEvidence } from '../src/core/search/evidence.ts';
 import { seedOffPath } from './helpers/evidence-delivery-fixture.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { asOwner } from './helpers/owner-tier.ts';
 
 // An HTTP client on the full surface with a read grant: `fetch` is callable, so lean rows carry `id`.
 const REMOTE: DispatchOpts = { remote: true, transport: 'http', sourceId: 'default', auth: { token: 't', clientId: 'client-a', clientName: 'a', scopes: ['read'], expiresAt: Date.now() / 1000 + 3600 } };
@@ -37,7 +38,7 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  await seedOffPath(engine);
+  await asOwner(engine, tx => seedOffPath(tx));
 }, 120_000);
 
 afterAll(async () => { await engine?.disconnect(); });
@@ -68,7 +69,11 @@ describe('lean rows for remote callers', () => {
       const full = await call(name, { ...params, fields: 'full' });
       const local = await call(name, params, { remote: false, sourceId: 'default' });
       expect(full.meta?.rows).toBe('full');
-      expect(full.rows.map(r => Object.keys(r).sort())).toEqual(local.rows.map(r => Object.keys(r).sort()));
+      // GST-2762: the keyless any-word fill lets the local caller see a private page the remote caller cannot; compare the rows both may read.
+      const readable = new Set(full.rows.map(r => `${r.source_id}:${r.slug}`));
+      const shared = local.rows.filter(r => readable.has(`${r.source_id}:${r.slug}`));
+      expect(shared.length).toBe(full.rows.length);
+      expect(full.rows.map(r => Object.keys(r).sort())).toEqual(shared.map(r => Object.keys(r).sort()));
       for (const key of ['page_id', 'chunk_index', 'chunk_source']) expect(full.rows[0], key).toHaveProperty(key);
     });
   }

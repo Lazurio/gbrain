@@ -20,14 +20,15 @@ export async function listAllSources(exec: LegacyUnscopedRead, opts?: {
     // how many archived rows exist. ORDER BY (id='default') DESC, id
     // matches sources-ops.listSources for operator-output stability.
     // localPathOnly skips pure-DB sources so autopilot fan-out doesn't
-    // dispatch jobs that would fall back to the global sync.repo_path.
+    // dispatch jobs that would fall back to the global sync.repo_path, and
+    // the storage shelf, whose cycle is always skipped (GST-1943).
     const includeArchived = opts?.includeArchived === true;
     const localPathOnly = opts?.localPathOnly === true;
     const { rows } = await exec.run(sqlFragment`
       SELECT id, name, local_path, last_sync_at, config
         FROM sources
        WHERE (${includeArchived} OR archived IS NOT TRUE)
-         AND (${!localPathOnly} OR local_path IS NOT NULL)
+         AND (${!localPathOnly} OR (local_path IS NOT NULL AND config->>'role' IS DISTINCT FROM 'storage_manifest'))
        ORDER BY (id = 'default') DESC, id
     `);
     return rows.map((r) => ({
@@ -57,9 +58,10 @@ export async function updateSourceConfig(exec: SqlExecutor, sourceId: string, pa
     // String branch guard: a JSONB string whose inner text is NOT itself valid
     // JSON (one of the historical bad shapes this path repairs) would make the
     // bare `::jsonb` cast raise `invalid input syntax for type json`, failing
-    // the whole UPDATE. Postgres has no `try_cast`, so we gate the cast with
-    // the SQL `IS JSON` predicate (Postgres 16+): parseable inner text is
-    // double-encoded config and gets parsed; unparseable text falls back to `{}`.
+    // the whole UPDATE. Postgres has no `try_cast`, so the cast goes through
+    // gbrain_try_jsonb (NULL on unparseable text; Postgres 15+, unlike IS JSON,
+    // #7112): parseable inner text is double-encoded config and gets parsed;
+    // unparseable text falls back to `{}`.
     // The guard keeps the merge a single atomic statement (no extra round-trip,
     // no lost-update race).
     //

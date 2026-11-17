@@ -37,7 +37,7 @@ import { sealSegmentedPage } from '../persistence/segmented-apply.ts';
 import { PROJECTION_RETRY_READY_SQL, SEGMENTED_JOB_PROBES, SEGMENTED_PROJECTION_CLAIM, SEGMENTED_PROJECTION_CLAIMED_SQL, SEGMENTED_PROJECTION_LEASE_SECONDS,
   type ProjectionRebuildFailure } from '../page-state/projections.ts';
 import { occurrencesWithoutChunks, stageOccurrenceChunks } from './ingest.ts';
-import { DEFAULT_FLIP_RETIRE_MAX_ROWS } from './limits.ts';
+import { PROJECTION_RETIRE_MAX_ROWS } from './limits.ts';
 import type { JsonObject } from './types.ts';
 import { assertGenerationTiles } from './body-tiling.ts';
 
@@ -45,12 +45,12 @@ import { assertGenerationTiles } from './body-tiling.ts';
 export interface SegmentedProjectionResult { chunks: number; retired: number; sealed: boolean; claimLost?: true }
 
 interface ProjectionPage {
-  id: number; body_generation: number | string; knowledge_revision: string; text_projection_revision: string | null;
+  id: number; body_generation: number | string; body_bytes: number | string; knowledge_revision: string; text_projection_revision: string | null;
   title: string; frontmatter: JsonObject | null; body_flags: JsonObject | null; timeline_lead: string | null;
 }
 
 async function readProjectionPage(engine: Pick<BrainEngine, 'executeRaw'>, ref: { sourceId: string; slug: string }): Promise<ProjectionPage | null> {
-  const [page] = await engine.executeRaw<ProjectionPage>(`SELECT id, body_generation, knowledge_revision::text AS knowledge_revision,
+  const [page] = await engine.executeRaw<ProjectionPage>(`SELECT id, body_generation, body_bytes, knowledge_revision::text AS knowledge_revision,
       text_projection_revision::text AS text_projection_revision, title, frontmatter, body_flags, timeline_lead
     FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL AND body_storage='segmented'`, [ref.sourceId, ref.slug]);
   return page ?? null;
@@ -90,8 +90,8 @@ export async function hasStaleChunks(engine: Pick<BrainEngine, 'executeRaw'>, pa
 }
 
 /**
- * Delete, in bounded batches, chunk rows the live generation does not hold: other occurrences, inline rows, older
- * duplicates. Each batch re-reads the page under its page lock and deletes only while the page is still segmented at
+ * Delete, in batches of PROJECTION_RETIRE_MAX_ROWS, chunk rows the live generation does not hold: other occurrences, inline
+ * rows, older duplicates. Each batch re-reads the page under its page lock and deletes only while the page is still segmented at
  * `generation` (a demotion's inline rows are the page's live chunks); `moved` when it was not.
  */
 async function retireStaleChunks(engine: BrainEngine, ref: { sourceId: string; slug: string }, pageId: number, generation: number,
@@ -103,11 +103,11 @@ async function retireStaleChunks(engine: BrainEngine, ref: { sourceId: string; s
       const [page] = await tx.executeRaw<{ body_generation: number | string; body_storage: string }>('SELECT body_generation, body_storage FROM pages WHERE id=$1', [pageId]);
       if (page?.body_storage !== 'segmented' || Number(page.body_generation) !== generation) return null;
       return (await tx.executeRaw<{ id: number }>(`DELETE FROM content_chunks c WHERE c.id=ANY(ARRAY(${STALE_CHUNKS_SQL} LIMIT $4)) RETURNING c.id`,
-        [pageId, generation, live, DEFAULT_FLIP_RETIRE_MAX_ROWS])).length;
+        [pageId, generation, live, PROJECTION_RETIRE_MAX_ROWS])).length;
     });
     if (deleted === null) return { retired, moved: true };
     retired += deleted;
-    if (deleted < DEFAULT_FLIP_RETIRE_MAX_ROWS) return { retired, moved: false };
+    if (deleted < PROJECTION_RETIRE_MAX_ROWS) return { retired, moved: false };
     if (engine.kind === 'pglite') await new Promise(resolve => setImmediate(resolve));
   }
 }
@@ -187,8 +187,8 @@ async function buildClaimedProjection(engine: BrainEngine, ref: { sourceId: stri
   claim: ProjectionClaim): Promise<SegmentedProjectionResult> {
   const generation = Number(page.body_generation);
   const pageId = Number(page.id);
-  const liveRows = await engine.readManifest(pageId);
-  await assertGenerationTiles(engine, pageId, generation, liveRows);
+  const liveRows = await engine.readManifest(pageId, { generation });
+  await assertGenerationTiles(engine, pageId, generation, liveRows, Number(page.body_bytes));
   const { retired, moved } = await retireStaleChunks(engine, ref, pageId, generation, liveRows.map(row => Number(row.occurrenceId)));
   if (moved) return { chunks: 0, retired, sealed: false };
   const frontmatter = page.frontmatter ?? {};

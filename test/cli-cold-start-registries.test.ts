@@ -46,6 +46,7 @@ const REGISTRATIONS: Record<string, Kind> = {
   'src/core/facts/queue.ts': 'owns-queue',
   'src/core/feedback/record.ts': 'owns-queue',
   'src/core/last-retrieved.ts': 'owns-queue',
+  'src/core/persistence/sync-ghosts.ts': 'owns-queue',
   'src/core/search/hybrid.ts': 'owns-queue',
   'src/core/search/telemetry.ts': 'owns-queue',
   'src/core/ai/gateway.ts': 'self',
@@ -94,7 +95,9 @@ describe('load-time registries under per-op loading', () => {
   test('every op loaded alone misses only registrations that cannot be observed incomplete', async () => {
     const registering = new Set(Object.keys(REGISTRATIONS));
     const full = (await loadedModules("await import('./src/core/operations.ts');")).filter(f => registering.has(f));
-    const names = Object.keys(OPERATION_LOADERS);
+    const byLoader = new Map<unknown, string>();
+    for (const [name, [load]] of Object.entries(OPERATION_LOADERS)) if (!byLoader.has(load)) byLoader.set(load, name);
+    const names = [...byLoader.values()];
     const missing = new Map<string, Set<string>>();
     for (let i = 0; i < names.length; i += 8) {
       await Promise.all(names.slice(i, i + 8).map(async (name) => {

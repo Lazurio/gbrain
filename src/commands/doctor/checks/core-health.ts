@@ -273,7 +273,7 @@ export async function jsonbIntegrityCheck(
       );
       if (!existsRows[0]?.exists) continue;
       const damage = jsonPayloadOnly
-        ? `jsonb_typeof(${col}) = 'string' AND (${col} #>> '{}') ~ '^[[:space:]]*[\\[{]' AND pg_input_is_valid(${col} #>> '{}', 'jsonb')`
+        ? `jsonb_typeof(${col}) = 'string' AND (${col} #>> '{}') ~ '^[[:space:]]*[\\[{]' AND gbrain_try_jsonb(${col} #>> '{}') IS NOT NULL`
         : `jsonb_typeof(${col}) = 'string'`;
       const rows = await engine.executeRaw<{ n: number }>(
         `SELECT count(*)::int AS n FROM ${table} WHERE ${damage}`,
@@ -549,7 +549,8 @@ export async function rawProvenanceCheck(engine: BrainEngine): Promise<Check> {
   const where = `
         p.deleted_at IS NULL
     AND (COALESCE(p.frontmatter->>'dream_generated', '') = 'true' OR p.type = 'synthesis')
-    AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ?| ARRAY['raw_trace', 'raw_source', 'source_uri', 'raw_trace_exempt'])
+    AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ?| ARRAY['raw_trace', 'raw_source', 'source_uri'])
+    AND COALESCE(p.frontmatter->>'raw_trace_exempt', '') <> 'true'
     AND NOT (p.type = 'atom'
       AND COALESCE(p.frontmatter->>'extracted_by', '') LIKE 'extract\\_atoms%'
       AND COALESCE(p.frontmatter, '{}'::jsonb) ?| ARRAY['source_slug', 'source_path'])

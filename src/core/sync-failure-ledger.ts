@@ -15,7 +15,7 @@
 //      forever — without ever silently dropping a FRESH failure, and
 //      never auto-skipping an infra sentinel like `<head>`.
 //
-// This module is a LEAF (imports only fs/path/crypto/config and the import-free
+// This module is a LEAF (imports only fs/os/path/crypto/config and the import-free
 // ai/errors.ts) so it can be
 // re-exported from sync.ts without a circular dependency. The state lives
 // in `~/.gbrain/sync-failures.jsonl`, one JSON object per line.
@@ -51,7 +51,9 @@ import {
   closeSync as _closeSync,
   unlinkSync as _unlinkSync,
   statSync as _statSync,
+  mkdtempSync as _mkdtempSync,
 } from 'fs';
+import { tmpdir as _tmpdir } from 'os';
 import { join as _joinPath } from 'path';
 import { gbrainPath as _gbrainPath } from './config.ts';
 import { createHash as _createHash } from 'crypto';
@@ -210,6 +212,9 @@ export function resolveAutoSkipThreshold(): number {
  * message. Order matters: DB-layer errors are checked BEFORE YAML-layer
  * ones so Postgres `duplicate key` isn't mislabeled as a YAML duplicate-key.
  */
+/** GST-2520: refusals caused by the source's or brain's mode, never the file: no edit to the file clears them, so a skip strands its page. */
+const MODE_REFUSAL_CODES = new Set(['strict_requires_managed', 'writer_coordinator_required']);
+
 /** Errno codes of a file the importer could not read: the file's own state, never a provider's. */
 const FILE_ERRNO_CODES: Record<string, string> = {
   EACCES: 'PERMISSION_DENIED', EPERM: 'PERMISSION_DENIED',
@@ -238,7 +243,23 @@ function providerText(errorMsg: string, path?: string): { text: string; envelope
 export function syncFailureCode(error: unknown, path?: string): string {
   const errno = (error as { code?: unknown } | null)?.code;
   if (typeof errno === 'string' && FILE_ERRNO_CODES[errno]) return FILE_ERRNO_CODES[errno]!;
+  if (typeof errno === 'string' && MODE_REFUSAL_CODES.has(errno)) return errno;
   return classifyErrorCode(error instanceof Error ? error.message : String(error), path);
+}
+
+/** The failure code for a file a git-canonical source refused because the brain is not managed (the error registry's code). */
+export const STRICT_REQUIRES_MANAGED = 'strict_requires_managed';
+
+/**
+ * The advice for a blocked sync whose failures are `strict_requires_managed`: the files are fine and the source's mode is the
+ * cause, so neither fixing YAML nor `--skip-failed` (which would move the checkpoint past content the database lacks) applies.
+ */
+export function strictRequiresManagedAdvice(sourceId: string | undefined): string {
+  const source = sourceId ?? 'default';
+  return `Source ${source} is git-canonical (canonical: git) and this brain does not have managed persistence, so gbrain imported none of these files; `
+    + 'the files themselves are fine. Ask the user whether to turn managed persistence on for this brain (docs/guides/concurrent-writes.md#local-registrations-and-canonical-ownership) and sync again, '
+    + `or, to rebuild a strict source's database from a clone, to follow docs/guides/git-canonical.md#rebuilding-a-strict-sources-database-from-a-clone. `
+    + 'Do not use --skip-failed: it would move the checkpoint past files whose content is not in the database.';
 }
 
 export function classifyErrorCode(errorMsg: string, path?: string): string {
@@ -256,8 +277,15 @@ export function classifyErrorCode(errorMsg: string, path?: string): string {
   // it the blocked-run breakdown also printed a bare `UNKNOWN: 1`.
   if (/rename reconcile failed|RENAME_RECONCILE/i.test(errorMsg)) return 'RENAME_RECONCILE';
 
+  // GST-2520: a refusal by the source's or brain's mode (persistence/maintenance.ts); a full import keeps only the message.
+  if (/cannot write git-canonical source \S+ on an unmanaged brain/.test(errorMsg)) return 'strict_requires_managed';
+  if (/cannot mutate a managed brain through the legacy writer/.test(errorMsg)) return 'writer_coordinator_required';
+
   // #5032: a ':' file name on Windows (src/commands/sync/imports.ts).
   if (/^colon_slug_windows_write_through:/.test(errorMsg)) return 'COLON_SLUG_WINDOWS_WRITE_THROUGH';
+
+  // A direct import into a git-canonical source on an unmanaged brain (assertNotStrictSource): the source's mode, not the file.
+  if (/cannot write git-canonical source .+ on an unmanaged brain|\bstrict_requires_managed\b/i.test(errorMsg)) return STRICT_REQUIRES_MANAGED;
 
   // SLUG_MISMATCH: thrown by importFromFile() at src/core/import-file.ts.
   if (/slug.*does not match|SLUG_MISMATCH/i.test(errorMsg)) return 'SLUG_MISMATCH';
@@ -405,7 +433,27 @@ export function formatFailedFileList(
  * unset-fallback behavior directly).
  */
 function _failuresDir(): string {
-  return process.env.GBRAIN_SYNC_FAILURES_DIR || _gbrainPath();
+  if (process.env.GBRAIN_SYNC_FAILURES_DIR) return process.env.GBRAIN_SYNC_FAILURES_DIR;
+  if (process.env.NODE_ENV === 'test' && !process.env.GBRAIN_HOME) return _testScratchDir();
+  return _gbrainPath();
+}
+
+let _testScratch: string | null = null;
+
+/**
+ * #7144: `bun test` loads `bunfig.toml` (and so every isolation preload) only
+ * from the directory it starts in, so a run started in `test/` or outside the
+ * repo set neither GBRAIN_SYNC_FAILURES_DIR nor GBRAIN_HOME, and broken-fixture
+ * sync tests appended their rows (`srcE / notes/bad.md SLUG_MISMATCH`) to the
+ * operator's real ledger. Bun sets NODE_ENV=test for every test run, so with
+ * neither override a test process gets its own scratch ledger instead.
+ */
+function _testScratchDir(): string {
+  if (!_testScratch) {
+    _testScratch = _mkdtempSync(_joinPath(_tmpdir(), 'gbrain-test-syncfail-'));
+    process.stderr.write(`[sync-failures] NODE_ENV=test without GBRAIN_SYNC_FAILURES_DIR or GBRAIN_HOME (bun test started outside the repo root?): this run's sync failure ledger is ${_testScratch}, not the real one.\n`);
+  }
+  return _testScratch;
 }
 
 export function syncFailuresPath(): string {
@@ -861,6 +909,7 @@ export function isEmbeddingInfraCode(code: string | undefined): boolean {
  *   --skip-failed                     → advance (ack handled post-advance)
  *   valve disabled (threshold<=0)     → block (pure fail-closed) if failures
  *   any fresh (attempts<threshold)    → block
+ *   any mode refusal (GST-2520)       → block, even with skipFailed (the setup, not the file)
  *   any embedding-infra code (#3875)  → block (provider unhealthy ≠ file poison;
  *                                       never auto-skip, regardless of attempts)
  *   all chronic (attempts>=threshold) → advance_then_autoskip
@@ -879,6 +928,7 @@ export function decideGateAction(args: {
 }): GateDecision {
   if (args.sentinels.length > 0) return { action: 'hard_block', autoSkipPaths: [] };
   if (args.fileFailures.length === 0) return { action: 'advance', autoSkipPaths: [] };
+  if (args.fileFailures.some(f => f.code !== undefined && MODE_REFUSAL_CODES.has(f.code))) return { action: 'block', autoSkipPaths: [] };
   if (args.skipFailed) return { action: 'advance', autoSkipPaths: [] };
   if (args.threshold <= 0) return { action: 'block', autoSkipPaths: [] };
   if (args.systemic) return { action: 'block', autoSkipPaths: [] };
@@ -1034,6 +1084,9 @@ export async function applySyncFailureGate(input: SyncGateInput): Promise<SyncGa
   }
 
   if (decision.action === 'hard_block' || decision.action === 'block') {
+    const mode = codes.find(f => MODE_REFUSAL_CODES.has(f.code));
+    if (mode) console.error(`  Not skipped${input.skipFailed ? ' (--skip-failed)' : ''}: ${mode.code} comes from how source ${input.sourceId} is set up, not from its files, so skipping them would leave their pages out for good. `
+      + (mode.code === 'strict_requires_managed' ? 'Turn on managed persistence for this brain, or remove canonical: git from the source; the next sync then imports them.' : 'Fix the setup the refusal names; the next sync then imports them.'));
     return {
       advanced: false,
       sentinelBlocked: decision.action === 'hard_block',

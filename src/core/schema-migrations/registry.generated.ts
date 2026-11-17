@@ -262,6 +262,62 @@ import { v258 } from './v258-pages-links-extract-failure.ts';
 import { v259 } from './v259-ingest-log-marked-index.ts';
 import { v260 } from './v260-segmented-page-size-index.ts';
 import { v261 } from './v261-persistence-request-transient-retries.ts';
+import { v262 } from './v262-commit-notifier.ts';
+import { v263 } from './v263-try-jsonb-function.ts';
+import { v264 } from './v264-set-based-fact-insert-guards.ts';
+import { v265 } from './v265-derived-generations.ts';
+import { v266 } from './v266-derived-generation-activations.ts';
+import { v267 } from './v267-pages-title-search-index.ts';
+import { v268 } from './v268-effect-claim-owner.ts';
+import { v269 } from './v269-links-supersedes-index.ts';
+import { v270 } from './v270-pages-source-created-index.ts';
+import { v271 } from './v271-facts-superseded-by-index.ts';
+import { v272 } from './v272-git-canonical-declared.ts';
+import { v273 } from './v273-segment-derivations.ts';
+import { v274 } from './v274-pages-withheld-source-path.ts';
+import { v275 } from './v275-rls-backfill-unguarded-tables.ts';
+import { v276 } from './v276-persistence-foreground-committed-index.ts';
+import { v277 } from './v277-function-search-path-pg-temp.ts';
+import { v278 } from './v278-writer-fence-fail-closed.ts';
+import { v279 } from './v279-outcome-markers-skip-purge-guard.ts';
+import { v280 } from './v280-principal-private-pages.ts';
+import { v281 } from './v281-derived-state-maintainers-fail-closed.ts';
+import { v282 } from './v282-member-read-access.ts';
+import { v283 } from './v283-folder-access-rules.ts';
+import { v284 } from './v284-access-page-indexes.ts';
+import { v285 } from './v285-slug-rename-history.ts';
+import { v286 } from './v286-qm-actor-links.ts';
+import { v287 } from './v287-multi-page-recovery-record.ts';
+import { v288 } from './v288-decide-proposals-claim-pair-index.ts';
+import { v289 } from './v289-page-change-reasons.ts';
+import { v290 } from './v290-wake-subscriptions.ts';
+import { v291 } from './v291-persistence-request-replay-indexes.ts';
+import { v292 } from './v292-refresh-write-barrier.ts';
+import { v293 } from './v293-qm-attest-sources.ts';
+import { v294 } from './v294-refresh-barrier-import-deferral.ts';
+import { v295 } from './v295-refresh-retry-hint-history-index.ts';
+import { v296 } from './v296-ingest-applied-captures.ts';
+import { v297 } from './v297-chronicle-judge-window.ts';
+import { v298 } from './v298-attest-read.ts';
+import { v299 } from './v299-access-member-sources.ts';
+import { v300 } from './v300-memory-proposals.ts';
+import { v301 } from './v301-member-email.ts';
+import { v302 } from './v302-link-transitions-source.ts';
+import { v303 } from './v303-access-page-rules.ts';
+import { v304 } from './v304-access-owner-origin.ts';
+import { v305 } from './v305-access-lineage-designs.ts';
+import { v306 } from './v306-member-page-withdrawal-scope.ts';
+import { v307 } from './v307-page-label-guards.ts';
+import { v308 } from './v308-access-labelled-only.ts';
+import { v309 } from './v309-requester-scope.ts';
+import { v310 } from './v310-mcp-request-log-rollup.ts';
+import { v311 } from './v311-concept-inputs-private.ts';
+import { v312 } from './v312-guest-notes.ts';
+import { v313 } from './v313-wake-events.ts';
+import { v314 } from './v314-guest-notes-fail-closed.ts';
+import { v315 } from './v315-facts-context-head-index.ts';
+import { v316 } from './v316-pages-source-type-index.ts';
+import { v317 } from './v317-pages-projection-waiting-index.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -522,4 +578,60 @@ export const MIGRATIONS: Migration[] = [
   v259,
   v260,
   v261,
+  v262,
+  v263,
+  v264,
+  v265,
+  v266,
+  v267,
+  v268,
+  v269,
+  v270,
+  v271,
+  v272,
+  v273,
+  v274,
+  v275,
+  v276,
+  v277,
+  v278,
+  v279,
+  v280,
+  v281,
+  v282,
+  v283,
+  v284,
+  v285,
+  v286,
+  v287,
+  v288,
+  v289,
+  v290,
+  v291,
+  v292,
+  v293,
+  v294,
+  v295,
+  v296,
+  v297,
+  v298,
+  v299,
+  v300,
+  v301,
+  v302,
+  v303,
+  v304,
+  v305,
+  v306,
+  v307,
+  v308,
+  v309,
+  v310,
+  v311,
+  v312,
+  v313,
+  v314,
+  v315,
+  v316,
+  v317,
 ];

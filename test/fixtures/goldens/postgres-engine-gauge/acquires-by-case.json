@@ -26,6 +26,8 @@
     "consolidateFact#default": {},
     "countChunklessPagesWithContent#default": {},
     "countChunklessPagesWithContent#sourceId": {},
+    "countPagesBy#grouped+since+remote": {},
+    "countPagesBy#totals": {},
     "countStaleChunks#default": {
       "raw": 1
     },
@@ -72,6 +74,8 @@
     "findOrphanPages#inbound": {},
     "findOrphanPages#sourceId": {},
     "findOrphanPages#sourceIds+excludePrivate": {},
+    "findPages#glob+types+sourceIds+remote": {},
+    "findPages#name": {},
     "findTrajectory#default": {},
     "findTrajectory#event": {},
     "findTrajectory#sourceIds+metric+since+until": {},
@@ -348,11 +352,11 @@
     "revertToVersion#default": {},
     "revertToVersion#sourceId": {},
     "searchKeyword#cjk": {
-      "raw": 3,
+      "raw": 2,
       "tx": 1
     },
     "searchKeyword#cjk+sourceIds+detailLow": {
-      "raw": 3,
+      "raw": 2,
       "tx": 1
     },
     "searchKeywordChunks#cjk": {
@@ -405,7 +409,7 @@
     "traversePathsDetailed#out+sourceId+linkType": {},
     "updatePageContextualRetrievalState#default": {},
     "updateSlug#moved": {
-      "raw": 13,
+      "raw": 17,
       "tx": 1
     },
     "updateSlug#noop": {

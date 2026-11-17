@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { pageQuarantinedNotice } from '../quarantine.ts';
+import { indexRestoredNotice } from './git-door.ts';
 import { fenceNormalizedNotice, type FencesNormalized } from '../fence-repair/report.ts';
 import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isHostAbsolutePath } from '../path-confine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { OperationError } from '../ops/contract.ts';
+import { admitChangeReason, CHANGE_REASON_OPERATIONS } from './change-reason.ts';
+import { grantedWriteSource, writeGrantRefusal } from './write-grant.ts';
 import { VERSION } from '../../version.ts';
 import { ownerBuildMismatch } from './publication-failure.ts';
 import { enforceClientSlugFence, enforceSubagentSlugFence, isLegacyStoredPageSlug, normalizeSlugPrefix, parseSourceIdParam, requireWritablePage, validatePageSlug } from '../ops/context.ts';
@@ -18,14 +22,16 @@ import { sha256 } from './digest.ts';
 import { receiptReservation } from './receipt-bytes.ts';
 import { assertPersistenceAccepting, estimatedRetryAfterMs, waiterOnlyOwner, onPersistenceLane, waitForWrite, writeResponse } from './service.ts';
 import { parseWireWriteWaitMs } from './write-wait.ts';
+import { withRefreshFenceBudget } from './admission-retry.ts';
 import { assertTimelineNotOmitted, isTimelineSection, timelineSectionOf, type TimelineSection } from './timeline-omission.ts';
 import { contentOriginTier } from '../trust/tier.ts';
 import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
-import { contentSizeHold } from '../markdown.ts';
+import { contentSizeHold, frontmatterBodyOffset, parseMarkdownHead } from '../markdown.ts';
+import { dataFrontmatter, dumpFrontmatterYaml } from '../data-frontmatter.ts';
 import { throwIfHeld } from '../trust/gate-outcomes.ts';
 import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequest, intentDigest, type WriteAdmission } from './journal.ts';
 import { submissionAuthority, authorizeStoredRequest } from './authority.ts';
-import { currentVerifiedLocalWriter, localHostId, readLocalWriter, registerLocalWriter, withVerifiedLocalRegistration } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor, readLocalWriter, registerLocalWriter, withVerifiedLocalRegistration } from './identity.ts';
 import type { BrainEngine } from '../engine.ts';
 import { claimWorktree, getWorktreeBinding } from './ownership.ts';
 import { clientRequestIdOf, parseMutationPrecondition } from './preconditions.ts';
@@ -35,13 +41,21 @@ import { normalizeSubagentPageInput, undeclaredPageTypeWarning, type PageTypeWar
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { decideUnboundWrite, isUnboundSourcePage } from './unbound-source.ts';
 import { assertRestoreOrigin } from './detached-pages.ts';
+import { isSourceDbOnlySlug } from './source-storage.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
-import { publishesDatabaseOnly } from './page-prepare.ts';
-import { materializedSnapshot } from './segmented-apply.ts';
+import { CALLER_CONTENT_OPERATIONS, publishesDatabaseOnly } from './page-prepare.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { liveSearchable } from './searchable.ts';
-import { cachedPreadmitBrain, dropPreadmitCache, preadmitReads, preadmitRecheckFailed } from './preadmit-cache.ts';
+import { ADMISSION_SOURCE_SQL, cachedPreadmitBrain, dropPreadmitCache, preadmitReads, preadmitRecheckFailed } from './preadmit-cache.ts';
 import { pipelined } from '../page-state/transactions.ts';
+import { holdsSummarizedToolCalls, isQuotedPageType, quotesTier, unquoteTranscriptText } from '../search/transcript-quote.ts';
+import { readStoredBody } from '../facts/file-body-guard.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
+import { perCallWriteSource } from '../access/attest-sources.ts';
+import type { GuestSource } from '../guests/sources.ts';
+import { admitGuestOperation, assertGuestFrontmatter, assertGuestReaders, GUEST_NOTE_INTENT_KEY, guestPageImmutable, guestSourcesUnreadable, refuseRemoteGuestDelete, schemaBehindGuests } from '../guests/admission.ts';
+import { currentCallerAccess } from '../search/private-visibility.ts';
+import { assertStorageSourceWriter } from '../storage-manifest/door.ts';
 
 export async function requestPrincipalForContext(ctx: OperationContext): Promise<Principal> {
   // #5994: a failed-writes replay is admitted under the original writer.
@@ -65,15 +79,16 @@ const flatSql = (sql: string) => sql.replace(/\s+/g, ' ').trim();
  * import's source-root and company-profile checks. All of them are rechecked
  * under lock by the admission transaction or by publication.
  */
+type AdmissionSource = { incarnation: string; archived: boolean; local_path: string | null; kind: string | null; role: string | null; guest_writers: string[] | null; guest_trust_ceiling: string | null; guest_sources_hidden: boolean };
 const BATCH_SHARED_READS = new Set([
-  "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1",
+  ADMISSION_SOURCE_SQL,
   'SELECT s.source_id,s.source_incarnation,s.worktree_id,s.relative_path, s.topology_generation::text AS topology_generation,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state, h.local_path,h.coordination_path FROM persistence_source_bindings s JOIN persistence_worktrees w ON w.id=s.worktree_id LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid WHERE s.source_id=$1',
   'SELECT lane,revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid',
   'SELECT local_path FROM sources WHERE id=$1 AND incarnation=$2::uuid',
   'SELECT brain_id FROM persistence_brain WHERE singleton=1',
   'SELECT value FROM config WHERE key=$1',
   "SELECT config,incarnation FROM sources WHERE id=$1",
-  "SELECT id FROM source_ingestion_receipts WHERE source_id=$1 AND source_incarnation=$2::uuid AND profile='company-brain' LIMIT 1",
+  "SELECT r.id FROM source_ingestion_receipts r JOIN sources s ON s.id=r.source_id AND s.incarnation=r.source_incarnation WHERE r.source_id=$1 AND r.profile='company-brain' LIMIT 1",
   'SELECT s.id,s.local_path,h.local_path AS worktree_path,b.relative_path FROM sources s LEFT JOIN persistence_source_bindings b ON b.source_id=s.id AND b.source_incarnation=s.incarnation LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid WHERE NOT s.archived',
 ]);
 /**
@@ -135,9 +150,9 @@ export function pageMutationSource(ctx: OperationContext, params: Record<string,
     throw new OperationError('invalid_params', 'A mutation must target exactly one source.',
       `Pass source_id as one source (for example ${ctx.sourceId && ctx.sourceId !== '__all__' ? ctx.sourceId : 'default'}); writes never fan out across sources.`);
   }
-  const granted = ctx.auth?.sourceId ?? ctx.sourceId ?? 'default';
-  if (ctx.remote !== false && sourceId !== granted) {
-    throw new OperationError('permission_denied', 'This source is outside the current write grant.',
+  const granted = grantedWriteSource(ctx);
+  if (ctx.remote !== false && sourceId !== granted && !perCallWriteSource(ctx, sourceId)) {
+    throw writeGrantRefusal(ctx,
       `This connection writes only to source ${granted}. Pass source_id ${granted} (or omit it), or ask the brain host's operator to grant write access to ${sourceId}.`);
   }
   return sourceId;
@@ -160,8 +175,9 @@ async function resolveCaptureFile(ctx: OperationContext, sourceId: string, p: Re
   delete p.local_file;
   const [source] = await ctx.engine.executeRaw<{ local_path: string | null }>('SELECT local_path FROM sources WHERE id=$1', [sourceId]);
   const binding = await getWorktreeBinding(ctx.engine, sourceId);
-  const root = binding ? binding.owner_host_id === localHostId() && binding.local_path ? join(binding.local_path, binding.relative_path) : null
+  let root = binding ? binding.owner_host_id === hostIdFor(ctx.engine) && binding.local_path ? join(binding.local_path, binding.relative_path) : null
     : source?.local_path || (sourceId === 'default' ? await ctx.engine.getConfig('sync.repo_path') : null);
+  if (root && !isHostAbsolutePath(root)) root = null;
   let origin: string | null = null;
   try { if (root) origin = relative(realpathSync(root), realpathSync(file)); } catch { /* unreadable or absent root */ }
   if (!root || !origin || isAbsolute(origin) || origin === '..' || origin.startsWith(`..${sep}`) || !/\.mdx?$/i.test(origin)) {
@@ -187,7 +203,7 @@ export function pendingAwareResponse(ctx: OperationContext, row: WriteRequest): 
  * A committed reply whose outcome left the projection pending says whether search sees the page now (searchable.ts), in
  * the reply and its `write_request`; `projection: 'pending'` stays only while it still is.
  */
-async function withLiveSearchable(ctx: OperationContext, response: Record<string, unknown>): Promise<Record<string, unknown>> {
+export async function withLiveSearchable(ctx: OperationContext, response: Record<string, unknown>): Promise<Record<string, unknown>> {
   if (response.searchable !== 'pending') return response;
   const live = await liveSearchable(ctx, response as Parameters<typeof liveSearchable>[1]);
   const settle = (fields: Record<string, unknown>) => {
@@ -198,13 +214,15 @@ async function withLiveSearchable(ctx: OperationContext, response: Record<string
   return { ...settle(response), ...(receipt ? { write_request: settle(receipt) } : {}) };
 }
 
-/** #6188 (D21): a write whose fence Tier 1 rewrote carries one `fence_normalized` coaching notice. */
+/** #6188 (D21): a write whose fence Tier 1 rewrote carries one `fence_normalized` coaching notice; a strict write whose door restored a stale index entry carries `git_index_restored`. */
 export function emitFenceNotice(ctx: Pick<OperationContext, 'emitNotice'>, response: Record<string, unknown>, slug?: string): void {
   const report = response.fences_normalized as FencesNormalized | undefined;
   if (report) ctx.emitNotice?.(fenceNormalizedNotice(report, slug));
   // #6259: a write the content-quality gate quarantined says so (`quarantined` plus one safety notice).
   const quarantined = response.quarantined as { reason: string; detail: string } | undefined;
   if (quarantined && slug) ctx.emitNotice?.(pageQuarantinedNotice(slug, quarantined, 'write'));
+  const restored = (response.persistence as { git_index_restored?: string[] } | undefined)?.git_index_restored;
+  if (restored?.length) ctx.emitNotice?.(indexRestoredNotice(restored));
 }
 
 /** Owner-internal `put_page` kinds the trusted local file writers (import, frontmatter repair, quarantine clear) submit; every other caller is refused them. */
@@ -214,7 +232,9 @@ const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 
 export interface PageBatchMember { id: string; index: number; size: number; requestId: string; repeats?: number[] }
 
 export async function submitPageMutation(ctx: OperationContext,
-  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection; databaseOnly?: 'overwrite_restore' }): Promise<Record<string, unknown>> {
+  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection; databaseOnly?: 'overwrite_restore' | 'detached';
+    /** commit_page_upload: `params.body_ref` names the caller's sealed upload session (persistence/page-upload.ts). */
+    stagedBody?: true }): Promise<Record<string, unknown>> {
   assertPersistenceAccepting(ctx.engine);
   // #6007: wait_ms is a reply deadline from arrival, never part of the write's identity.
   const arrived = performance.now();
@@ -228,8 +248,9 @@ export async function submitPageMutation(ctx: OperationContext,
   if (prepared.prior) return withLiveSearchable(ctx, throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false));
   const brainId = cached ? cachedPreadmitBrain(ctx.engine) : undefined;
   // Phase 4.4: the admission transaction runs on the warm single-write lane when it is free.
-  const admit = (admission: WriteAdmission) => onPersistenceLane(ctx.engine, transaction => admitWrite(ctx.engine, admission, undefined, transaction),
-    () => admitWrite(ctx.engine, admission));
+  // GST-1387: an explicit wait_ms also bounds the refresh-fence wait, so wait_ms 0 is refused at once, never held.
+  const admit = (admission: WriteAdmission) => withRefreshFenceBudget(() => onPersistenceLane(ctx.engine, transaction => admitWrite(ctx.engine, admission, undefined, transaction),
+    () => admitWrite(ctx.engine, admission)), wireWaitMs !== undefined ? waitMs() : undefined);
   let row: WriteRequest;
   try { row = await admit(brainId ? { ...prepared.admission, brainId } : prepared.admission); }
   catch (error) {
@@ -245,6 +266,92 @@ export async function submitPageMutation(ctx: OperationContext,
 }
 
 /**
+ * #8042: a remote put_page (put_pages too) of a quoted page's get_page content writes the page body, not the fences
+ * get_page added (search/transcript-quote.ts). A fence naming the page is removed when its stored type or the type the
+ * new content declares is one get_page quotes (either, so a retype keeps the body), or (GST-687) when the stored page is
+ * below the owner's tier, which get_page quotes too; an owner-tier note keeps a fence naming it only when its stored body
+ * already holds one, so a fence read before a claim raised the page's tier is never stored.
+ * GST-687: content carrying a tool-call summary that only the neutralized read of the stored chat page holds (get_page's
+ * reading shape, fetch) is refused, so a read-then-write never replaces a stored tool call with its summary.
+ */
+/** Every string in `value` with the fences naming `slug` removed (get_page's quotedPageMeta, reversed). */
+function unquotedStrings(value: unknown, slug: string): unknown {
+  return typeof value === 'string' ? unquoteTranscriptText(value, slug)
+    : Array.isArray(value) ? value.map(v => unquotedStrings(v, slug))
+    : value && typeof value === 'object' && !(value instanceof Date) ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, unquotedStrings(v, slug)])) : value;
+}
+
+/**
+ * #8377: a quoted read's reading shape fences the title and each frontmatter string as `slug`'s (a whole-markdown read is
+ * fenced once instead, and its metadata is the page's own). YAML indents those fences, so the body's unquote misses them.
+ * #8384: only the top-level keys that held a fence are rewritten; every other line keeps the bytes the caller sent, so a
+ * naive datetime keeps its brain-timezone reading. A fenced key not found on its own line, or a line rewrite that does not
+ * parse back to the unquoted values (a flow mapping continued on an unindented line, an anchor another key aliases),
+ * rewrites the whole block.
+ */
+function unquotedFrontmatter(sent: string, content: string, slug: string): string {
+  const offset = frontmatterBodyOffset(content);
+  if (!offset || !frontmatterBodyOffset(sent) || !content.slice(0, offset).includes('```text')) return content;
+  const { frontmatter } = parseMarkdownHead(content);
+  const data = unquotedStrings(frontmatter, slug) as Record<string, unknown>;
+  const fenced = new Set(Object.keys(data).filter(k => JSON.stringify(data[k]) !== JSON.stringify(frontmatter[k])));
+  if (!fenced.size) return content;
+  const lines = content.slice(0, offset).split('\n');
+  const open = lines.findIndex(l => l.trim() === '---');
+  const close = lines.findIndex((l, i) => i > open && l.trim() === '---');
+  const out = lines.slice(0, open + 1);
+  for (let i = open + 1; i < close;) {
+    let end = i + 1;
+    while (end < close && /^(?:[ \t]|-(?:[ \t]|\r?$)|\r?$)/.test(lines[end]!)) end++;
+    const m = /^(?:"([^"]*)"|'([^']*)'|([^\s#'"-][^:]*?))[ \t]*:(?:[ \t]|\r?$)/.exec(lines[i]!);
+    const key = m?.[1] ?? m?.[2] ?? m?.[3];
+    if (key !== undefined && fenced.delete(key)) {
+      const eol = lines[i]!.endsWith('\r') ? '\r' : '';
+      out.push(...dumpFrontmatterYaml({ [key]: data[key] }).trimEnd().split('\n').map(l => l + eol));
+    } else out.push(...lines.slice(i, end));
+    i = end;
+  }
+  const whole = dataFrontmatter.stringify('', data) + content.slice(offset);
+  if (fenced.size) return whole;
+  const partial = [...out, ...lines.slice(close)].join('\n') + content.slice(offset);
+  try {
+    return JSON.stringify(parseMarkdownHead(partial).frontmatter) === JSON.stringify(data) ? partial : whole;
+  } catch {
+    return whole;
+  }
+}
+
+async function unquotedPutContent(engine: BrainEngine, sourceId: string, slug: string, content: string): Promise<string> {
+  const bodyUnquoted = unquoteTranscriptText(content, slug, true);
+  const unquoted = unquotedFrontmatter(content, bodyUnquoted, slug);
+  const summarized = /, arguments omitted\]/.test(unquoted);
+  const quotedType = isQuotedPageType(String(parseMarkdownHead(unquoted).frontmatter.type ?? ''));
+  if (!summarized && (unquoted === content || quotedType)) return unquoted;
+  const [stored] = await engine.executeRaw<{ type: string | null; trust_tier: string | null; title: string | null; frontmatter: unknown }>(
+    'SELECT type, trust_tier, title, frontmatter FROM pages WHERE source_id = $1 AND slug = $2', [sourceId, slug]);
+  // Compared with the stored body's tool calls; a segmented page reads NULL inline columns, so its summarized round trip is refused.
+  const losesCalls = async () => {
+    const body = await readStoredBody(engine, sourceId, slug);
+    return body?.compiled_truth == null || holdsSummarizedToolCalls(`${body.compiled_truth}\n${body.timeline ?? ''}`, unquoted);
+  };
+  if (summarized && stored && isQuotedPageType(stored.type) && await losesCalls()) {
+    throw new OperationError('invalid_params', `put_page: this content has tool calls that a read of ${slug} summarized; writing it would replace the stored calls with their summaries.`,
+      'Nothing was written. Change the page with edit_page, or read it with get_page include_content: true (its content keeps the stored text) and write that back.');
+  }
+  if (unquoted === content || quotedType) return unquoted;
+  if (!stored) return content;
+  if (isQuotedPageType(stored.type) || quotesTier(stored.trust_tier)) return unquoted;
+  // An owner-tier page keeps a fence naming it only when its stored body already holds one: a fence read while the page sat
+  // below the owner's tier (before a claim or backfill raised it, or from a quoted version) is a read's, not the page's.
+  // Its title and frontmatter are judged the same way, by the stored title and frontmatter.
+  const body = await readStoredBody(engine, sourceId, slug);
+  const storedText = `${body?.compiled_truth ?? ''}\n${body?.timeline ?? ''}`;
+  const kept = body?.compiled_truth != null && unquoteTranscriptText(storedText, slug) === storedText ? bodyUnquoted : content;
+  const storedMeta = [stored.title, typeof stored.frontmatter === 'string' ? JSON.parse(stored.frontmatter) : stored.frontmatter];
+  return JSON.stringify(unquotedStrings(storedMeta, slug)) === JSON.stringify(storedMeta) ? unquotedFrontmatter(content, kept, slug) : kept;
+}
+
+/**
  * Every check a page mutation passes before it is journaled, without admitting
  * it: either the authorized prior request with this request_id (a replay), or
  * the admission to submit. `put_pages` admits several of these together.
@@ -252,7 +359,7 @@ export async function submitPageMutation(ctx: OperationContext,
 export async function preparePageAdmission(ctx: OperationContext,
   input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember; timelineSection?: TimelineSection;
     /** #6712 `repair overwritten-edits`: publish to the database only, so the restore never rewrites the committed file. */
-    databaseOnly?: 'overwrite_restore' }
+    databaseOnly?: 'overwrite_restore' | 'detached'; stagedBody?: true }
 ): Promise<{ prior: WriteRequest; admission?: undefined; typeWarning?: undefined; slugAdvisory?: undefined } | { prior?: undefined; admission: WriteAdmission; typeWarning: PageTypeWarning | null; slugAdvisory: string | null }> {
   if (input.operation === 'put_page' && ['kind', 'preview', 'backup_reference'].some(key => Object.hasOwn(input.params, key))) {
     if (ctx.remote !== false || input.managedFileImport !== true || !OWNER_FILE_INTENTS.has(String(input.params.kind)) ||
@@ -261,10 +368,28 @@ export async function preparePageAdmission(ctx: OperationContext,
         'Drop kind, preview and backup_reference from put_page; reconciling a canonical file runs through gbrain sources reconcile on the brain host.');
     }
   }
+  // #8765 review: a managed_sync_ kind marks managed sync's own rows, so no page write may carry one (a capture's event kind).
+  if (typeof input.params.kind === 'string' && input.params.kind.startsWith('managed_sync_')) {
+    throw new OperationError('invalid_params', `kind ${input.params.kind} is reserved for managed sync, so nothing was written.`,
+      'Use another kind, or drop kind.');
+  }
+  const bodyRefKind = (input.params.body_ref as { kind?: unknown } | null | undefined)?.kind;
+  const staged = input.stagedBody === true && ['put_page', 'append_page'].includes(input.operation) && bodyRefKind === 'staging';
+  const imported = input.managedFileImport === true && input.operation === 'put_page' && bodyRefKind === 'input_file';
+  if (Object.hasOwn(input.params, 'body_ref') && ((!staged && !imported) || Object.hasOwn(input.params, 'content') || Object.hasOwn(input.params, 'text'))) {
+    throw new OperationError('invalid_params', 'body_ref is reserved for commit_page_upload.',
+      'Drop body_ref and send the page as content; a page larger than one request goes through begin_page_upload, upload_page_part and commit_page_upload.');
+  }
   // #6188: a fence repair's receipt is recorded only by the trusted local fence repair, never by a caller.
   if (Object.hasOwn(input.params, 'fence_repair') && (input.operation !== 'put_page' || ctx.remote !== false || !parseFenceRepairReceipt(input.params.fence_repair))) {
     throw new OperationError('invalid_params', 'fence_repair is reserved for the trusted fence repair.',
       'Drop fence_repair and submit the page without it; gbrain repair fences records its own receipt on the brain host. To fix a malformed facts or takes fence, correct it in content (or write facts with remember and takes with takes_add); a held file is repaired by the brain host operator with gbrain repair fences, so ask the user to run it.');
+  }
+  // G6: the hidden-row merge of an untrusted capture's body (page-prepare.ts) is opted into only by the trusted local ingest_capture
+  // handler, whose caller never saw the page's non-world rows; a remote put_page has it already, through its authority.
+  if (Object.hasOwn(input.params, 'keep_hidden_rows') && (input.operation !== 'put_page' || ctx.remote !== false || input.params.keep_hidden_rows !== true)) {
+    throw new OperationError('invalid_params', 'keep_hidden_rows is reserved for trusted local ingestion.',
+      'Drop keep_hidden_rows and submit the page without it; a remote put_page already keeps the rows its caller could not read.');
   }
   // A body over the page ceiling can never be admitted: refuse it as a caller error before the journal
   // reserves intent bytes, so an oversized write never reads as retryable queue_capacity.
@@ -275,7 +400,7 @@ export async function preparePageAdmission(ctx: OperationContext,
     throw new OperationError('request_too_large', contentSizeHold(bodyBytes, PAGE_MAX_BYTES)!.message,
       `Nothing was admitted or written, and the same content is refused on every retry. Pages up to ${PAGE_MAX_BYTES} bytes are stored and searchable; send a smaller page.`);
   }
-  const { page_batch: _forged, timeline_section: _section, ...params } = input.params;
+  const { page_batch: _forged, timeline_section: _section, [GUEST_NOTE_INTENT_KEY]: _guestNote, ...params } = input.params;
   const p: Record<string, unknown> = { ...params, ...parseMutationPrecondition(params) };
   if (p.content_origin !== undefined) contentOriginTier(p.content_origin);
   if (input.batch) p.page_batch = { id: input.batch.id, index: input.batch.index, size: input.batch.size, ...(input.batch.repeats?.length ? { repeats: input.batch.repeats } : {}) };
@@ -285,10 +410,24 @@ export async function preparePageAdmission(ctx: OperationContext,
   const captureSlug = input.operation === 'capture' ? await resolveCaptureFile(ctx, sourceId, p) : null;
   const principal = await requestPrincipalForContext(ctx);
   // Independent reads go out together on Postgres; the first refusal in this order is the one reported.
-  const [, prior] = await pipelined(ctx.engine, [
+  const [, prior, [source]] = await pipelined(ctx.engine, [
     () => assertPageRequestIdentity(ctx.engine, principal, requestId),
     () => getWriteRequest(ctx.engine, principal, requestId),
-  ]) as [unknown, WriteRequest | null];
+    () => ctx.engine.executeRaw<AdmissionSource>(ADMISSION_SOURCE_SQL, [sourceId]).catch(e => schemaBehindGuests(ctx.engine, e)),
+  ]) as [unknown, WriteRequest | null, AdmissionSource[]];
+  if (source?.guest_sources_hidden) throw guestSourcesUnreadable(sourceId);
+  const guest: GuestSource | null = source?.guest_writers ? { source_id: sourceId, writers: source.guest_writers, trust_ceiling: source.guest_trust_ceiling! } : null;
+  // GBRA-504: a guest source admits only its listed writers' plain put_page, carrying the guest attribution, which joins
+  // the intent (and so the replay identity) here; every other write to it is refused before anything is journaled.
+  const guestNote = guest ? admitGuestOperation(guest, { principal, operation: input.operation, remote: ctx.remote !== false,
+    plainPut: !input.batch && !staged && !imported && input.managedFileImport !== true, params: p, channels: ctx.guestChannels }) : null;
+  if (guestNote) p[GUEST_NOTE_INTENT_KEY] = guestNote;
+  // GBRA-217: a reason is refused before anything is journaled; its canonical form joins the replay identity. An
+  // operation that records no reason never journals one a caller passed anyway.
+  if (CHANGE_REASON_OPERATIONS.includes(input.operation) && Object.hasOwn(p, 'reason')) {
+    const reason = admitChangeReason(p.reason);
+    if (reason === null) delete p.reason; else p.reason = reason;
+  } else delete p.reason;
   const callerIntent = { ...p };
   delete callerIntent.request_id;
   if (prior) {
@@ -298,11 +437,16 @@ export async function preparePageAdmission(ctx: OperationContext,
     return { prior };
   }
   if (input.operation === 'delete_page') assertPurgeParams(p, ctx.remote);
-  const [source] = await ctx.engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null; kind: string | null }>(
-    "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  if (guest && input.operation === 'delete_page' && ctx.remote !== false && typeof p.slug === 'string') await refuseRemoteGuestDelete(ctx.engine, sourceId, p.slug.toLowerCase(), principal);
   if (!source || source.archived) {
     throw new OperationError('source_changed', 'The write source is not active.',
       `Source ${sourceId} is archived or not registered, so nothing was written. Write to an active source (sources_list shows them).`);
+  }
+  // GST-1943: the storage manifest takes page writes only from the storage verbs (and the owner's import of its own commits).
+  assertStorageSourceWriter(ctx, sourceId, source.role, { managedFileImport: input.managedFileImport });
+  // After the replay check: the request digest covers what the caller sent, so a retry matches whatever the page's type is by then.
+  if (input.operation === 'put_page' && ctx.remote !== false && typeof p.content === 'string' && typeof p.slug === 'string') {
+    p.content = await unquotedPutContent(ctx.engine, sourceId, p.slug.toLowerCase(), p.content);
   }
   let slug = typeof p.slug === 'string' ? p.slug.toLowerCase() : '';
   const intent = ['takes_add','takes_update','takes_supersede','takes_resolve','takes_remove'].includes(input.operation)
@@ -348,10 +492,15 @@ export async function preparePageAdmission(ctx: OperationContext,
   // terminal replay depend on a page that may have since been purged.
   if (input.operation === 'add_timeline_entry') await requireWritablePage({ ...ctx, sourceId }, slug, input.operation, 'page');
   intent.slug = slug;
-  if (ctx.remote !== false) Object.assign(intent, { source_kind: `mcp:${input.operation}`, source_uri: null, ingested_via: `mcp:${input.operation}` });
+  // #8667: only a remote write that supplies page text is an ingestion; any other keeps the page's provenance.
+  if (ctx.remote !== false) {
+    const via = CALLER_CONTENT_OPERATIONS.includes(input.operation) ? `mcp:${input.operation}` : null;
+    Object.assign(intent, { source_kind: via, source_uri: null, ingested_via: via });
+  }
   const [authority, , snapshot, boundAtStart, writeThroughSetting, repoPath] = await pipelined(ctx.engine, [
     () => submissionAuthority(ctx, input.operation, sourceId, source.incarnation, slug),
-    () => assertKnowledgePublicationAllowed(ctx.engine, { source_id: sourceId, source_incarnation: source.incarnation, slug }),
+    () => assertKnowledgePublicationAllowed(ctx.engine, { source_id: sourceId, source_incarnation: source.incarnation, slug, operation: input.operation,
+      intent: { purge: intent.purge, retention: intent.retention } }),
     () => ctx.engine.readPageSnapshot(slug, { sourceId, includeDeleted: true }),
     () => getWorktreeBinding(ctx.engine, sourceId),
     () => ctx.engine.getConfig('sync.write_through'),
@@ -361,29 +510,45 @@ export async function preparePageAdmission(ctx: OperationContext,
     await assertTimelineNotOmitted(ctx.engine, { intent, remote: ctx.remote !== false, writer: typeof p.expected_revision === 'string' ? 'editing' : 'preserving',
       slug, sourceId, content: intent.content, prior: snapshot });
   }
-  const slugAdvisory = input.operation === 'put_page' && input.managedFileImport !== true
-    ? suffixedSlugAdmission(ctx, slug, !!snapshot && !snapshot.page.deleted_at) : null;
+  if (guestNote) {
+    if (snapshot?.page.deleted_at) throw guestPageImmutable(`put_page over the deleted guest page ${slug}`);
+    await assertGuestReaders(ctx.engine, assertGuestFrontmatter(p.content, guestNote), currentCallerAccess().audience);
+  }
+  const slugAdvisory = (input.operation === 'put_page' || input.operation === 'capture') && input.managedFileImport !== true
+    ? suffixedSlugAdmission(ctx, slug, !!snapshot && !snapshot.page.deleted_at, input.operation) : null;
   // #5616: typed edit refusals before admission; publication repeats them on the locked snapshot.
   if (input.operation === 'edit_page') {
-    const { applyPageEdits, assertEditRevision, parsePageEdits } = await import('./page-edit.ts');
+    const { applyPageEdits, assertEditRevision, assertSegmentedEditFences, parseEditWithin, parsePageEdits } = await import('./page-edit.ts');
     if (!snapshot || snapshot.page.deleted_at) throw new OperationError('page_not_found', `Page not found: ${slug}`, 'edit_page changes an existing page; create it with put_page.');
     assertEditRevision(snapshot.revision, p.expected_revision);
-    applyPageEdits((await materializedSnapshot(ctx.engine, snapshot))!.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits));
+    const within = parseEditWithin(p.within);
+    // A segmented page is matched by its preparation, which streams the segments (spec 6.3): never read whole here.
+    if (!isSegmentedPage(snapshot.page)) applyPageEdits(snapshot.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits), within);
+    else { parsePageEdits(p.edits); await assertSegmentedEditFences(ctx.engine, snapshot.page, within, ctx.remote !== false); }
+  }
+  // Wave B: an append names an existing page; its preconditions are checked when it is prepared, on the page it extends.
+  if (input.operation === 'append_page' && (!snapshot || snapshot.page.deleted_at)) {
+    throw new OperationError('page_not_found', `Page not found: ${slug}`, 'append_page adds to an existing page; create it with put_page.');
   }
   let binding = boundAtStart;
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
   const configuredWriteThrough = !/^(false|0|off|no)$/i.test(writeThroughSetting ?? 'true');
-  const writeThrough = configuredWriteThrough && !sandbox && !input.databaseOnly;
-  const root = source.local_path || repoPath;
+  const configuredRoot = source.local_path || repoPath;
+  const root = configuredRoot && isHostAbsolutePath(configuredRoot) ? configuredRoot : null;
+  // Checkout paths belong to a host binding; sources.local_path may name
+  // another host's original checkout after a verified ownership transfer.
+  const localRoot = binding ? binding.owner_host_id === hostIdFor(ctx.engine) && binding.local_path
+    ? join(binding.local_path, binding.relative_path) : null : root;
+  // #7324: a declared db_only page is canonical in the database, so its detach restore publishes database-only even
+  // where write-through would re-create its file (a managed checkout); assertRestoreOrigin still requires the file gone.
+  const databaseOnly = input.databaseOnly ?? (input.operation === 'restore_page' && p.detach === true && localRoot
+    && isSourceDbOnlySlug(localRoot, slug, 'not_db_only') ? 'detached' : undefined);
+  const writeThrough = configuredWriteThrough && !sandbox && !databaseOnly;
   if (sandbox) authority.databaseOnlyReason = 'subagent_sandbox';
-  else if (input.databaseOnly) authority.databaseOnlyReason = input.databaseOnly;
+  else if (databaseOnly) authority.databaseOnlyReason = databaseOnly;
   else if (!configuredWriteThrough) authority.databaseOnlyReason = 'disabled_by_config';
-  else if (!root && !binding) authority.databaseOnlyReason = 'no_repo_configured';
+  else if (!root && !binding) authority.databaseOnlyReason = configuredRoot ? 'relative_root' : 'no_repo_configured';
   if (p.local_dir !== undefined) {
-    // Checkout paths belong to a host binding; sources.local_path may name
-    // another host's original checkout after a verified ownership transfer.
-    const localRoot = binding ? binding.owner_host_id === localHostId() && binding.local_path
-      ? join(binding.local_path, binding.relative_path) : null : root;
     let matches = false;
     if (ctx.remote === false && typeof p.local_dir === 'string' && localRoot) {
       try { matches = realpathSync(resolve(p.local_dir)) === realpathSync(resolve(localRoot)); } catch { /* missing local binding */ }
@@ -406,7 +571,7 @@ export async function preparePageAdmission(ctx: OperationContext,
   // #5032: this host publishes the canonical file, and on Windows a ':' in its
   // name cannot be stored; refuse before admission. Database-only writes pass,
   // including read-only mirror sources and pages created while one (#5409).
-  if (writeThrough && binding?.owner_host_id === localHostId() && binding.local_path && isWindowsColonTarget(snapshot?.page.source_path ?? `${slug}.md`)
+  if (writeThrough && binding?.owner_host_id === hostIdFor(ctx.engine) && binding.local_path && isWindowsColonTarget(snapshot?.page.source_path ?? `${slug}.md`)
     && !(snapshot && !snapshot.page.source_path && await isUnboundSourcePage(ctx.engine, sourceId, slug))
     && !await sourceMirrorReadOnly(ctx.engine, sourceId)
     && !(snapshot && !snapshot.page.source_path && await isMirrorOnlyPage(ctx.engine, sourceId, slug))
@@ -416,5 +581,5 @@ export async function preparePageAdmission(ctx: OperationContext,
   return { typeWarning, slugAdvisory, admission: { origin: ctx.admissionOrigin, principal, operation: input.operation, sourceId, sourceIncarnation: source.incarnation,
     slug, pageId: snapshot?.page.id ?? null, requestId, clientRequestId: input.batch ? undefined : clientRequestIdOf(params.request_id), callerIntent, intent, authority,
     ...(input.operation === 'edit_page' ? { terminalReservation: receiptReservation({ intent, authority }, (await import('./page-edit.ts')).EDIT_PAGE_RECEIPT_RESERVE) } : {}),
-    worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null } };
+    worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null, deferrable: true } };
 }

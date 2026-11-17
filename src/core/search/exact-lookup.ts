@@ -11,6 +11,12 @@
  *   title probe  — an exact (normalized) full-title equality match, read off
  *                  the ALREADY-FETCHED page-grain title arm (zero extra
  *                  queries on the hot path).
+ *   identifier   — #7163: a query that is one phone number, email, URL, long
+ *                  digit run, hex id or code reads candidate chunks through
+ *                  the full-text index in every common written form and keeps
+ *                  the pages whose chunk text really contains it
+ *                  (search/identifier-query.ts). One keyword read, only for
+ *                  identifier-shaped queries.
  *
  * Supersession-filtered: a page that a `supersedes` link marks stale is
  * NEVER top-injected by this tier (the organic pipeline still surfaces it,
@@ -22,7 +28,7 @@
  * already in the organic set are promoted to rank-1; absent hits inject at
  * top-of-organic + epsilon (the alias-hop injection shape, page_id
  * included). Injected/promoted rows carry:
- *   - exact_lookup: 'slug' | 'title'  (autocut preserve predicate + telemetry)
+ *   - exact_lookup: 'slug' | 'title' | 'identifier'  (autocut preserve predicate + telemetry)
  *   - slug hits: alias_hit=true        (evidence → alias_hit → 'exists')
  *   - title hits: title_match_boost    (evidence → exact_title_match → 'exists')
  * so the T4 evidence/create_safety contract reads them as identity matches
@@ -39,6 +45,10 @@ import { normalizeAlias } from './alias-normalize.ts';
 import { isLookupShapedQuery } from './query-intent.ts';
 import { applySupersedeDownrank } from './hybrid.ts';
 import { isExcludedIdentity } from './alias-hop.ts';
+import { identifierKeywordQuery, parseIdentifier, textContainsIdentifier } from './identifier-query.ts';
+
+/** Keyword rows read for an identifier query before the containment check. */
+export const IDENTIFIER_POOL = 30;
 
 /** Cap on tier injections per query (mirrors the alias hop's discipline). */
 export const MAX_EXACT_LOOKUP_INJECT = 3;
@@ -157,6 +167,29 @@ export async function structuralExactLookup(
     }
   }
 
+  // #7163 identifier probe — a phone number, email, URL, long digit run, hex id
+  // or code: candidate chunks through the full-text index in every common
+  // written form, kept only when the chunk text really contains it.
+  const ident = parseIdentifier(q);
+  if (ident) {
+    try {
+      const rows = await engine.searchKeyword(identifierKeywordQuery(ident), {
+        limit: IDENTIFIER_POOL,
+        sourceId: opts.sourceId,
+        sourceIds: opts.sourceIds,
+        excludePrivate: opts.excludePrivate,
+        requireSafeChunks: opts.requireSafeChunks,
+        ...(opts.type ? { type: opts.type as SearchResult['type'] } : {}),
+        ...(opts.types?.length ? { types: opts.types as SearchResult['type'][] } : {}),
+      });
+      for (const r of rows) {
+        if (!r.keyword_relaxed && textContainsIdentifier(r.chunk_text, ident)) push({ ...r, keyword_hit: true, exact_lookup: 'identifier' });
+      }
+    } catch {
+      // fail-open: identifier probe error → no tier hit
+    }
+  }
+
   if (hits.length === 0) return [];
 
   // Supersession filter — a stale (superseded) page never wins the identity
@@ -176,9 +209,10 @@ export async function structuralExactLookup(
  * Mirrors applyAliasHop's contract: hits already present are promoted to the
  * top (score = current-top + epsilon) and stamped; absent hits inject with
  * the same top-of-organic + epsilon score shape. Identity rows move to the
- * front; every other row keeps its input order (never re-sorted by `score`,
- * which would discard a reranked order). Returns a NEW array; fail-open
- * returns `results` unchanged.
+ * front in the hits' own order (#7935: the first hit ends at rank 1 with the
+ * highest score); every other row keeps its input order (never re-sorted by
+ * `score`, which would discard a reranked order). Returns a NEW array;
+ * fail-open returns `results` unchanged.
  */
 export async function applyExactLookupTier(
   engine: BrainEngine,
@@ -208,7 +242,7 @@ export function applyExactLookupHits(results: SearchResult[], hits: readonly Sea
   const topScore = out.reduce((m, r) => (Number.isFinite(r.score) && r.score > m ? r.score : m), 0);
   let injectScore = topScore > 0 ? topScore : 1.0;
 
-  for (const hit of hits) {
+  for (const hit of [...hits].reverse()) {
     injectScore += 1e-6;
     const matchingIndexes: number[] = [];
     for (let i = 0; i < out.length; i++) {

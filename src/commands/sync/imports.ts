@@ -33,9 +33,11 @@ import type { SyncOpts, SyncResult } from '../sync.ts';
 import { clearLegacyHold, holdClassicFile, holdRefusedImport, noteScreenedImport, type LegacyHolds } from './holds.ts';
 import { classifyClassicFile } from '../../core/classic-file-holds.ts';
 import { partial, markCompleted, noteTypeWarning, maybeYield } from './sync-run.ts';
+import { fileHistory } from './reasons.ts';
 import type { SyncPlan, SyncProgress, SyncRun } from './sync-run.ts';
+import { noteCommittedProgress } from '../../core/forward-progress.ts';
 
-type ImportPlan = Pick<SyncPlan, 'opts' | 'filtered' | 'lastCommit' | 'pin' | 'company' | 'gitContextRoot' | 'syncImportRoot' | 'syncActivePack' | 'holds'>;
+type ImportPlan = Pick<SyncPlan, 'opts' | 'filtered' | 'lastCommit' | 'pin' | 'company' | 'gitContextRoot' | 'syncImportRoot' | 'syncActivePack' | 'holds' | 'reasons'>;
 
 type ImportContext = {
   opts: SyncOpts;
@@ -48,6 +50,7 @@ type ImportContext = {
   progressAt: { last: number };
   progress: SyncProgress;
   holds: LegacyHolds | null;
+  reasons: SyncPlan['reasons'];
 };
 
 /** The add/modify drain. Returns a partial result when the run aborts. */
@@ -58,7 +61,7 @@ export async function runImportsPhase(
   noEmbed: boolean,
 ): Promise<SyncResult | undefined> {
   const { engine, completed } = run;
-  const { filtered, company, gitContextRoot, syncImportRoot, syncActivePack, holds } = plan;
+  const { filtered, company, gitContextRoot, syncImportRoot, syncActivePack, holds, reasons } = plan;
   let { opts } = plan;
   // Process adds and modifies.
   //
@@ -116,7 +119,7 @@ export async function runImportsPhase(
     opts = watchdog.opts;
     const { stallTimer, progressAt } = watchdog;
 
-    const ctx: ImportContext = { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds };
+    const ctx: ImportContext = { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds, reasons };
     const aborted = await drainImports(run, plan, ctx, importsToDo, effectiveConcurrency, runParallel, stallTimer);
     if (aborted) return aborted;
 
@@ -266,7 +269,7 @@ export function poolLine(engine: unknown): string {
 /** Core import logic shared by the serial and parallel paths. */
 async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine, path: string): Promise<void> {
   const { failedFiles, succeededPaths, pagesAffected, deletedSlugs } = run;
-  const { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds } = ctx;
+  const { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds, reasons } = ctx;
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `path` is a git-diff path from the synced repo (repo content can be hostile), but the joined path is checked by isPathSafe(filePath, gitContextRoot) realpath containment below before any read
   const filePath = join(syncRepoPath, path);
   // #5032: Windows cannot store ':' in a file name (it names an alternate data
@@ -352,7 +355,7 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
     const result = await observed(pacer, () =>
       isImageImportPath(path) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? importImageFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId })
-        : company ? importCompanyBrainFile(eng, filePath, opts.sourceId!) : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
+        : company ? importCompanyBrainFile(eng, filePath, opts.sourceId!) : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack, history: fileHistory(reasons, filePath) }));
     noteTypeWarning(run, result.type_warning);
     noteScreenedImport(holds, path, result);
     if (await holdRefusedImport(eng, holds, path, filePath, result)) {
@@ -371,6 +374,7 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
       // much actually landed before --timeout fired.
       run.filesImported++;
       run.itemRun.succeed();
+      noteCommittedProgress();
       await clearLegacyHold(eng, holds, path);
       // v0.42.x (#1794): checkpoint this path so a kill banks it.
       await markCompleted(run, path);

@@ -31,7 +31,7 @@
  * leaves pending fingerprints the next run treats as owned, so a resume never
  * duplicates an entry, and an untrusted hook never runs.
  */
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { atomicWriteTextFile } from '../bootstrap/atomic-write.ts';
 import { ownedEntryFingerprint } from '../bootstrap/adopted-connections.ts';
@@ -49,8 +49,10 @@ import {
   type CodexSetupEvent,
 } from '../bootstrap/codex-hooks.ts';
 import { stdioServeArgv } from '../mcp-registration.ts';
+import { withStdioMember } from '../stdio-member-flag.ts';
 import type { McpSurface } from '../../mcp/surface.ts';
 import { SetupAbortInjected, type SetupConsent, type SetupStep } from './claude-code.ts';
+import { ensureHookLauncher, hookLauncherPath } from './hook-launcher.ts';
 
 export const CODEX_SETUP_RECEIPT_VERSION = 2;
 
@@ -69,6 +71,8 @@ export interface CodexSetupReceipt {
   launcher: string;
   source_id: string | null;
   surface: McpSurface;
+  /** The registration's `--advertise` (absent: tools/list shows the whole surface). */
+  advertise?: McpSurface;
   config_path: string;
   hooks_path: string;
   entry_hash: string | null;
@@ -91,7 +95,11 @@ export interface CodexSetupPlan {
   gbrainHomeEnv?: string;
   sourceId: string | null;
   surface: McpSurface;
+  /** `serve --advertise`; null lists the whole surface. */
+  advertise: McpSurface | null;
   events: CodexSetupEvent[];
+  /** GST-363: `serve --stdio-member`: this entry's sessions read as that member. Only a named --stdio-member or the entry setup already wrote sets it. */
+  stdioMember?: string;
 }
 
 export type CodexSetupStep = Omit<SetupStep, 'step'> & { step: SetupStep['step'] | 'trust' };
@@ -103,7 +111,8 @@ export interface CodexInspection {
   receiptPath: string;
   prior: CodexSetupReceipt | null;
   hostedReceipt: { mcp_url?: string } | null;
-  mcp: { state: 'absent' | 'current' | 'owned' | 'remote' | 'unowned'; url?: string };
+  /** stdioMember: the --stdio-member of an entry setup owns (current or owned), which a rewrite carries forward. */
+  mcp: { state: 'absent' | 'current' | 'owned' | 'remote' | 'unowned'; url?: string; stdioMember?: string };
   /** Events already wired by gbrain's bootstrap Codex lane (token-owned). */
   otherLaneEvents: string[];
   /** Owned events whose group the user edited: preserved, never rewritten. */
@@ -131,16 +140,37 @@ export function readCodexSetupReceipt(receiptPath: string): { setup: CodexSetupR
 
 const writeReceipt = (path: string, receipt: CodexSetupReceipt) => atomicWriteTextFile(path, `${JSON.stringify(receipt, null, 2)}\n`, { forceMode: 0o600 });
 
-export function desiredCodexMcpEntry(plan: Pick<CodexSetupPlan, 'launcher' | 'surface' | 'gbrainHomeEnv' | 'sourceId'>): Record<string, CodexTomlValue> {
+/**
+ * Provider key and endpoint names Codex forwards from its own environment to
+ * serve. Codex starts stdio servers with a scrubbed environment, so a key the
+ * user exported never reached serve and search stayed keyword-only. Names
+ * only: Codex reads each value from its own environment at launch and skips
+ * a name that is unset, so no value is ever written to config.toml. The
+ * provider subset of the plugin lane's .codex-plugin/mcp.json env_vars
+ * (test/setup-codex-env-vars.test.ts keeps them equal).
+ */
+export const CODEX_FORWARDED_PROVIDER_ENV: readonly string[] = [
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'AZURE_OPENAI_API_KEY', 'DASHSCOPE_API_KEY', 'DEEPGRAM_API_KEY', 'DEEPSEEK_API_KEY',
+  'GEMINI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY', 'GOOGLE_GENERATIVE_AI_BASE_URL', 'GROQ_API_KEY', 'JEV_TYPESAFE_API_KEY',
+  'LITELLM_API_KEY', 'LITELLM_BASE_URL', 'LLAMA_SERVER_API_KEY', 'LLAMA_SERVER_BASE_URL', 'LLAMA_SERVER_RERANKER_API_KEY',
+  'LLAMA_SERVER_RERANKER_BASE_URL', 'LMSTUDIO_API_KEY', 'LMSTUDIO_BASE_URL', 'MINIMAX_API_KEY', 'MISTRAL_API_KEY', 'MOONSHOT_API_KEY',
+  'NAN_API_KEY', 'NVIDIA_API_KEY', 'OLLAMA_API_KEY', 'OLLAMA_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENROUTER_API_KEY',
+  'OPENROUTER_BASE_URL', 'PARTICLE_API_KEY', 'PERPLEXITY_API_KEY', 'PPLX_API_KEY', 'TOGETHER_API_KEY', 'TYPESAFE_API_KEY',
+  'VOYAGE_API_KEY', 'ZHIPUAI_API_KEY',
+];
+
+export function desiredCodexMcpEntry(plan: Pick<CodexSetupPlan, 'launcher' | 'brainHome' | 'surface' | 'advertise' | 'gbrainHomeEnv' | 'sourceId' | 'stdioMember'>): Record<string, CodexTomlValue> {
   const env: Record<string, string> = {};
   if (plan.gbrainHomeEnv) env.GBRAIN_HOME = plan.gbrainHomeEnv;
   if (plan.sourceId) env.GBRAIN_SOURCE = plan.sourceId;
-  return { command: plan.launcher, args: stdioServeArgv(plan.launcher, plan.surface).slice(1), ...(Object.keys(env).length ? { env } : {}) };
+  // Codex starts stdio servers in the session's directory, so serve starts through the launcher too (#8426).
+  return { command: hookLauncherPath(plan.brainHome), args: stdioServeArgv(plan.launcher, plan.surface, plan.advertise, plan.stdioMember), ...(Object.keys(env).length ? { env } : {}),
+    env_vars: [...CODEX_FORWARDED_PROVIDER_ENV] };
 }
 
 function desiredGroups(plan: CodexSetupPlan): Partial<Record<CodexSetupEvent, CodexHookGroup>> {
   const env = { GBRAIN_HOME: plan.gbrainHomeEnv, GBRAIN_SOURCE: plan.sourceId ?? undefined };
-  return Object.fromEntries(plan.events.map((e) => [e, codexSetupHookGroup(plan.launcher, e, env)]));
+  return Object.fromEntries(plan.events.map((e) => [e, codexSetupHookGroup(plan.launcher, e, env, 'setup', hookLauncherPath(plan.brainHome))]));
 }
 
 const hashes = (groups: Partial<Record<CodexSetupEvent, CodexHookGroup>>): Hashes =>
@@ -174,9 +204,9 @@ export function inspectCodexSetup(plan: CodexSetupPlan): CodexInspection {
   const desired = ownedEntryFingerprint(desiredCodexMcpEntry(plan));
   const entryFp = entry === undefined ? null : ownedEntryFingerprint(entry);
   const mcp: CodexInspection['mcp'] = entry === undefined ? { state: 'absent' }
-    : entryFp === desired ? { state: 'current' }
+    : entryFp === desired ? withStdioMember({ state: 'current' }, entry)
       : typeof (entry as Record<string, unknown>)?.url === 'string' ? { state: 'remote', url: (entry as Record<string, string>).url }
-        : prior && [prior.entry_hash, prior.pending_entry_hash].includes(entryFp) ? { state: 'owned' } : { state: 'unowned' };
+        : prior && [prior.entry_hash, prior.pending_entry_hash].includes(entryFp) ? withStdioMember({ state: 'owned' }, entry) : { state: 'unowned' };
 
   const census = codexHookCensus(paths.hooksPath);
   const groups = desiredGroups(plan);
@@ -225,6 +255,21 @@ export interface CodexApplyResult { steps: CodexSetupStep[]; receipt: CodexSetup
  * `beforeMcp` runs after the receipt is prepared (the brain init step);
  * `abortAfter` is the crash-injection test seam.
  */
+/** The current text of each file setup may rewrite, read before it writes; absent files have nothing to back up. */
+function readOriginals(paths: string[]): Array<{ path: string; text: string }> {
+  return paths.filter((path) => existsSync(path)).map((path) => ({ path, text: readFileSync(path, 'utf8') }));
+}
+
+/** Keep `<file>.bak.<stamp>` of each file setup changed (the autopilot convention); one note per backup. */
+function keepBackups(originals: Array<{ path: string; text: string }>): string[] {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return originals.filter(({ path, text }) => !existsSync(path) || readFileSync(path, 'utf8') !== text).map(({ path, text }) => {
+    const bakPath = `${path}.bak.${stamp}`;
+    writeFileSync(bakPath, text, { mode: 0o600 });
+    return `${path} as it was before setup changed it: ${bakPath}`;
+  });
+}
+
 export async function applyCodexSetup(
   plan: CodexSetupPlan,
   consent: SetupConsent,
@@ -233,7 +278,10 @@ export async function applyCodexSetup(
   const paths = codexSetupPaths(plan.name);
   mkdirSync(dirname(paths.configPath), { recursive: true, mode: 0o700 });
   const lock = await acquireBootstrapLock(dirname(paths.configPath));
+  const originals = readOriginals([paths.configPath, paths.hooksPath]);
   try {
+    // The MCP table and every hook command start gbrain through the launcher, so it goes down before anything names it (#8424, #8426).
+    ensureHookLauncher(hookLauncherPath(plan.brainHome));
     const found = inspectCodexSetup(plan);
     const prior = found.prior;
     const now = new Date().toISOString();
@@ -259,7 +307,7 @@ export async function applyCodexSetup(
     const receipt: CodexSetupReceipt = {
       harness: 'codex', connection: 'local-stdio', setup_receipt_version: CODEX_SETUP_RECEIPT_VERSION, status: 'prepared',
       name: plan.name, gbrain_home: plan.brainHome, ...(plan.gbrainHomeEnv ? { gbrain_home_env: plan.gbrainHomeEnv } : {}),
-      launcher: plan.launcher, source_id: plan.sourceId, surface: plan.surface,
+      launcher: plan.launcher, source_id: plan.sourceId, surface: plan.surface, ...(plan.advertise ? { advertise: plan.advertise } : {}),
       config_path: paths.configPath, hooks_path: paths.hooksPath,
       entry_hash: prior?.entry_hash ?? null, pending_entry_hash: opts.pluginOwner ? null : desiredHash,
       ...(prior?.mcp_adopted ? { mcp_adopted: true } : {}),
@@ -352,7 +400,11 @@ export async function applyCodexSetup(
     if (opts.abortAfter === 'trust') throw new SetupAbortInjected('trust');
     receipt.status = 'installed';
     save();
+    notes.push(...keepBackups(originals));
     return { steps, receipt, changed: true, preserved, notes };
+  } catch (e) {
+    keepBackups(originals);
+    throw e;
   } finally {
     lock.release();
   }
@@ -363,6 +415,7 @@ export interface CodexRemoveResult { steps: CodexSetupStep[]; preserved: CodexPr
 /** Remove exactly what the receipt owns by fingerprint (trust, hooks, MCP, receipt); edited entries survive and are reported. */
 export async function removeCodexSetup(receipt: CodexSetupReceipt, receiptPath: string, opts: { dryRun: boolean }): Promise<CodexRemoveResult> {
   const lock = await acquireBootstrapLock(dirname(receipt.config_path));
+  const originals = readOriginals([receipt.config_path, receipt.hooks_path]);
   try {
     const steps: CodexSetupStep[] = [];
     const preserved: CodexPreserved[] = [];
@@ -432,7 +485,11 @@ export async function removeCodexSetup(receipt: CodexSetupReceipt, receiptPath: 
         steps.push({ step: 'receipt', action: 'remove', detail: receiptPath });
       }
     }
+    notes.push(...keepBackups(originals));
     return { steps, preserved, notes, receiptRemoved };
+  } catch (e) {
+    keepBackups(originals);
+    throw e;
   } finally {
     lock.release();
   }

@@ -20,6 +20,7 @@ import { markKeywordHits } from '../evidence.ts';
 import { resolveEffectiveRecency, resolveEffectiveSalience } from './effective-modes.ts';
 import { searchSalvageEnabled } from '../token-budget.ts';
 import { isDatetimeInputError, warnOncePerProcess } from '../../utils.ts';
+import { withUrgentSearchConnections } from '../connection-budget.ts';
 
 export interface LexicalArms {
   earlyModality: ModalityMode;
@@ -277,18 +278,18 @@ export function startVectorSide(req: HybridRequest, multimodalProviderProbe: str
   const timer = req.timer.branch();
   const degraded: HybridRequest['degraded'] = [];
   const side: HybridRequest = { ...req, timer, degraded, searchOpts: { ...req.searchOpts, onVectorPoolMeta: vectorPoolMetaSink(req, degraded) } };
-  const work = (async () => {
+  const work = withUrgentSearchConnections(async () => {
     const modality = await resolveModalityAndQueries(side);
     return { ...modality, ...await runVectorArms(side, { ...modality, multimodalProviderProbe }) };
-  })();
+  });
   return { work, timer, req: side };
 }
 
 /** Lexical then relational arms on the critical path; a failure waits for the vector side to settle before it is rethrown. */
 export async function runLexicalAndRelational(req: HybridRequest, earlyModality: ModalityMode, vectorSide: VectorSide | null) {
   try {
-    const lexical = await req.timer.stage('lexical', () => runLexicalArms(req, earlyModality));
-    const relationalList = await req.timer.stage('relational', () => buildRelationalList(req));
+    const lexical = await req.timer.stage('lexical', () => withUrgentSearchConnections(() => runLexicalArms(req, earlyModality)));
+    const relationalList = await req.timer.stage('relational', () => withUrgentSearchConnections(() => buildRelationalList(req)));
     return { lexical, relationalList };
   } catch (err) {
     if (vectorSide) await Promise.allSettled([vectorSide.work]);
@@ -366,6 +367,7 @@ export async function runVectorArms(
         pushVectorList(vectorArms, unifiedList, 'original');
         queryEmbedding = unifiedEmbedding;
         unifiedDone = true;
+        req.imageArmRan = true;
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -401,6 +403,7 @@ export async function runVectorArms(
         r.modality = r.modality ?? 'image';
       }
       imageVectorList = imageList;
+      req.imageArmRan = true;
     } catch (err) {
       // Fail-open per behavioral invariant 2.
       const reason = err instanceof Error ? err.message : String(err);

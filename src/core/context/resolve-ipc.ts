@@ -37,6 +37,10 @@
  *     response, and an old serve answers `unknown_kind:sync_start` so the
  *     client degrades to the documented stop-the-serve refusal.
  *
+ *   sync_nudge (secret-gated, protocol:2, versioned) — GBRA-133 PR 2a: record a
+ *     wanted marker (sync trigger, a busy delegated sync) and nudge the serve's
+ *     commit notifier; acknowledged with the marker. Wire shapes in sync-ipc.ts.
+ *
  *   sweep_start / sweep_status (secret-gated, protocol:2) — #677:
  *     serve-delegated maintenance sweep, the same start+poll shape as the
  *     sync kinds (no abort — a sweep is a bounded run). Wire shapes in
@@ -67,6 +71,8 @@ import type { TurnContextResult } from './turn-context.ts';
 import type {
   SyncAbortRequest,
   SyncAbortResponse,
+  SyncNudgeRequest,
+  SyncNudgeResponse,
   SyncStartRequest,
   SyncStartResponse,
   SyncStatusRequest,
@@ -241,6 +247,7 @@ export type IpcRequest =
   | SyncStartRequest
   | SyncStatusRequest
   | SyncAbortRequest
+  | SyncNudgeRequest
   | SweepStartRequest
   | SweepStatusRequest;
 
@@ -279,6 +286,7 @@ export type ContextPackHandler = (req: ContextPackRequest, progress?: { assemble
 export type SyncStartIpcHandler = (req: SyncStartRequest) => SyncStartResponse | Promise<SyncStartResponse>;
 export type SyncStatusIpcHandler = (req: SyncStatusRequest) => SyncStatusResponse | Promise<SyncStatusResponse>;
 export type SyncAbortIpcHandler = (req: SyncAbortRequest) => SyncAbortResponse | Promise<SyncAbortResponse>;
+export type SyncNudgeIpcHandler = (req: SyncNudgeRequest) => SyncNudgeResponse | Promise<SyncNudgeResponse>;
 export type SweepStartIpcHandler = (req: SweepStartRequest) => SweepStartResponse | Promise<SweepStartResponse>;
 export type SweepStatusIpcHandler = (req: SweepStatusRequest) => SweepStatusResponse | Promise<SweepStatusResponse>;
 
@@ -290,6 +298,7 @@ export interface IpcHandlers {
   sync_start?: SyncStartIpcHandler;
   sync_status?: SyncStatusIpcHandler;
   sync_abort?: SyncAbortIpcHandler;
+  sync_nudge?: SyncNudgeIpcHandler;
   sweep_start?: SweepStartIpcHandler;
   sweep_status?: SweepStatusIpcHandler;
 }
@@ -382,12 +391,19 @@ export interface IpcPathConfig {
  * defers instead of unlinking it, #4896). The persistence socket ignores
  * `sourceId`: it routes to the single resident owner, so it stays
  * brain-keyed. Bound-source rejection [CX2-10] still applies per request.
+ *
+ * #7612: `read` is the socket a lean serve (a read-only stdio serve on
+ * Postgres, which registers no delegated sync, nudge or sweep kind) binds
+ * instead of the two above, keyed like the source socket. It answers only
+ * resolve, turn_context and context_pack, so it never takes the
+ * delegation-capable sockets from a read-write serve. PGLite has none (a
+ * PGLite serve is never lean).
  */
-export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined, kind: 'resolve' | 'persistence' = 'resolve', sourceId?: string): string | null {
+export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined, kind: 'resolve' | 'persistence' | 'read' = 'resolve', sourceId?: string): string | null {
   if (!cfg) return null;
-  if (cfg.engine === 'pglite' && cfg.database_path) return localIpcSocketPath(join(cfg.database_path, `.gbrain-${kind}.sock`));
+  if (cfg.engine === 'pglite' && cfg.database_path) return kind === 'read' ? null : localIpcSocketPath(join(cfg.database_path, `.gbrain-${kind}.sock`));
   if (cfg.engine === 'postgres' && cfg.database_url) {
-    const sourceKey = kind === 'resolve' && sourceId ? `-${hash12(sourceId)}` : '';
+    const sourceKey = kind !== 'persistence' && sourceId ? `-${hash12(sourceId)}` : '';
     return localIpcSocketPath(join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}${sourceKey}.sock`));
   }
   return null;
@@ -395,15 +411,20 @@ export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined
 
 /**
  * The resolve socket a hook calls (#5042): its own source's socket
- * (`GBRAIN_SOURCE`, else `default`) when a serve listens there, else the
- * legacy URL-only socket (an older serve, or a serve bound to a source the
- * hook does not name). PGLite has a single path (one serve per data dir).
+ * (`GBRAIN_SOURCE`, else `default`) when a serve listens there, then a lean
+ * serve's read socket for that source (#7612), else the legacy URL-only
+ * socket (an older serve, or a serve bound to a source the hook does not
+ * name). A delegation client (`delegation: true`) skips the read socket: a
+ * lean serve registers no delegated kind. PGLite has a single path (one
+ * serve per data dir).
  */
-export async function hookResolveSocketForConfig(cfg: IpcPathConfig | null | undefined, sourceId: string | undefined): Promise<string | null> {
+export async function hookResolveSocketForConfig(cfg: IpcPathConfig | null | undefined, sourceId: string | undefined, opts: { delegation?: boolean } = {}): Promise<string | null> {
   const legacy = resolveSocketPathForConfig(cfg);
   const keyed = resolveSocketPathForConfig(cfg, 'resolve', sourceId || 'default');
   if (!legacy || !keyed || keyed === legacy) return legacy;
-  return (await socketHasLiveListener(keyed)) ? keyed : legacy;
+  if (await socketHasLiveListener(keyed)) return keyed;
+  const read = opts.delegation ? null : resolveSocketPathForConfig(cfg, 'read', sourceId || 'default');
+  return read && (await socketHasLiveListener(read)) ? read : legacy;
 }
 
 /**
@@ -635,6 +656,8 @@ export type SyncAbortClientRequest = Omit<SyncAbortRequest, 'kind' | 'protocol'>
 export type SyncStartIpcResult = SyncStartResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 export type SyncStatusIpcResult = SyncStatusResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 export type SyncAbortIpcResult = SyncAbortResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SyncNudgeClientRequest = Omit<SyncNudgeRequest, 'kind' | 'protocol'>;
+export type SyncNudgeIpcResult = SyncNudgeResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 
 /**
  * Delegated-sync clients: same fail-soft ladder as requestTurnContext —
@@ -669,6 +692,16 @@ export async function requestSyncAbort(
 ): Promise<SyncAbortIpcResult> {
   const line = JSON.stringify({ kind: 'sync_abort', protocol: 2, ...req } satisfies SyncAbortRequest);
   return syncRoundTrip<SyncAbortResponse>(socketPath, line, opts.timeoutMs ?? SYNC_ABORT_CLIENT_TIMEOUT_MS);
+}
+
+/** GBRA-133 PR 2a: record a wanted marker through the serve (same fail-soft ladder; an older serve reads stale_serve). */
+export async function requestSyncNudge(
+  socketPath: string,
+  req: SyncNudgeClientRequest,
+  opts: { timeoutMs?: number } = {},
+): Promise<SyncNudgeIpcResult> {
+  const line = JSON.stringify({ kind: 'sync_nudge', protocol: 2, ...req } satisfies SyncNudgeRequest);
+  return syncRoundTrip<SyncNudgeResponse>(socketPath, line, opts.timeoutMs ?? SYNC_START_CLIENT_TIMEOUT_MS);
 }
 
 // ── Delegated-sweep clients (#677) — same fail-soft ladder as sync ─────────
@@ -887,6 +920,10 @@ export async function startResolveIpcServer(
           } else if (kind === 'sync_abort') {
             resp = JSON.stringify(
               await handleSyncKind(parsed as SyncAbortRequest, handlers.sync_abort, opts),
+            );
+          } else if (kind === 'sync_nudge') {
+            resp = JSON.stringify(
+              await handleSyncKind(parsed as SyncNudgeRequest, handlers.sync_nudge, opts),
             );
           } else if (kind === 'sweep_start') {
             resp = JSON.stringify(

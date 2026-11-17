@@ -12,6 +12,7 @@ import {
 } from '../../core/minions/source-filesystem.ts';
 import { currentJobSignal, currentSubmissionAuthority } from '../../core/minions/submission-authority.ts';
 import { currentCompanyBrainSync, getCompanyBrainProfile } from '../../core/company-brain/profile.ts';
+import { endSyncDispatchRead, syncDispatchRow } from '../../core/sync-dispatch-read.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import type { OperationContext } from '../../core/ops/contract.ts';
 import { refreshProjectionStatistics } from '../../core/search/projection-statistics.ts';
@@ -19,13 +20,30 @@ import { withRefreshingLock, LockUnavailableError, LockStolenError, syncLockId }
 import { readSyncAnchor } from '../../core/sync-anchor.ts';
 import { recordUpstreamObservation } from '../../core/sync-upstream.ts';
 import { assertSyncApplicable } from '../../core/sync-applicability.ts';
+import { performPlainDirectorySync, plainDirectorySyncRoot } from './plain-directory.ts';
 import { noteIdentityDowngrades } from '../../core/sync-identity-downgrades.ts';
 import { SyncLockBusyError, formatLockBusyMessage, buildPartialResult } from '../../core/sync-lock.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
+import type { IdleSkip } from '../../core/persistence/sync-idle-skips.ts';
 import { runConnectorSync } from './connector.ts';
 import { performSyncInner } from './incremental.ts';
+import { isConnectorSourceKind } from '../../core/persistence/connector-kinds.ts';
+import { ignoredPrivacyLabelRunNotice } from '../../core/search/ignored-privacy-labels.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  const since = opts.dryRun ? null : await syncStartedAt(engine);
+  const result = await routeSync(engine, opts);
+  if (!since || result.privacy_label_notice || result.status === 'up_to_date' || result.status === 'dry_run') return result;
+  const notice = await ignoredPrivacyLabelRunNotice(engine, opts.sourceId ?? 'default', result.pagesAffected?.length ? { slugs: result.pagesAffected } : { since }, 'sync');
+  return notice ? { ...result, privacy_label_notice: notice } : result;
+}
+
+/** GST-2462: the database clock when a sync starts; a managed sync lists no pages, so its notice reads the pages updated since. */
+async function syncStartedAt(engine: BrainEngine): Promise<string | null> {
+  try { return (await engine.executeRaw<{ at: string }>('SELECT clock_timestamp()::text AS at'))[0]?.at ?? null; } catch { return null; }
+}
+
+async function routeSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
   assertSyncDispatchActive();
   const inheritedSignal = currentSourceFilesystemSignal();
   if (inheritedSignal) opts = { ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, inheritedSignal]) : inheritedSignal };
@@ -50,15 +68,20 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
   };
   const company = !opts.signal?.aborted && opts.sourceId && !currentCompanyBrainSync(opts.sourceId) && await getCompanyBrainProfile(engine, opts.sourceId);
   assertSyncDispatchActive();
+  const mayBeConnector = managed && await mayBeConnectorSource(engine, opts);
+  // GBRA-133: the route is chosen; the work reads live (core/sync-dispatch-read.ts).
+  endSyncDispatchRead();
   if (company) {
     if (opts.signal?.aborted) return finish(await interruptedBeforeWork());
     return (await import('../../core/company-brain/runtime.ts')).performCompanyBrainSync(engine, opts);
   }
-  if (managed) {
+  if (mayBeConnector) {
     const connector = await runConnectorSync(engine, opts, true);
     if (connector) return connector;
   }
   if (opts.signal?.aborted) return finish(await interruptedBeforeWork());
+  const plainRoot = await plainDirectorySyncRoot(engine, opts, managed);
+  if (plainRoot) return finish(await performPlainDirectorySync(engine, opts, plainRoot, managed), true);
   if (managed) return performManagedBranch(engine, opts);
   const filesystemRoot = opts.repoPath || await readSyncAnchor(engine, opts.sourceId, 'repo_path');
   if (filesystemRoot && !hasSourceFilesystemLock(filesystemRoot)) {
@@ -102,6 +125,17 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
   }
 }
 
+/** Whether `runConnectorSync` may sync this source: false only when the routing row shows a source it returns null for. */
+async function mayBeConnectorSource(engine: BrainEngine, opts: SyncOpts): Promise<boolean> {
+  const routing = opts.sourceId && !opts.githubItem && !opts.resetCheckpoint ? await syncDispatchRow(engine, opts.sourceId) : undefined;
+  if (!routing) return true;
+  if (routing.id === null) return false;
+  try {
+    const config = typeof routing.config === 'string' ? JSON.parse(routing.config) : routing.config ?? {};
+    return isConnectorSourceKind(config.kind);
+  } catch { return true; }
+}
+
 /**
  * The managed branch: the drain (or one pass), its staged stages and the post-sync settles, all under the source's drain
  * lease (#6712 PR 1, persistence/sync-lease.ts). A plain CLI sync follows a live holder within its budget; every other
@@ -109,11 +143,15 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
  */
 async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promise<SyncResult> {
   const sourceId = outer.sourceId ?? 'default';
-  const { withDrainLease } = await import('../../core/persistence/sync-lease.ts');
+  const { currentDrainLease, withDrainLease } = await import('../../core/persistence/sync-lease.ts');
   const lockKey = syncLockId(sourceId);
+  // GBRA-133: the settles an idle-clear tick leaves nothing to do (persistence/sync-idle-skips.ts), read inside the lease.
+  let skips: ReadonlySet<IdleSkip> = new Set();
   const work = async (leaseSignal: AbortSignal | undefined): Promise<SyncResult> => {
     const opts: SyncOpts = leaseSignal ? { ...outer, signal: outer.signal ? AbortSignal.any([outer.signal, leaseSignal]) : leaseSignal } : outer;
-    let result = opts.drain
+    // #7167: a dry run reads and previews once; the drain's stall governor (no commit in 5 min) would abandon a long read
+    // of a large source as a writer stall, and nothing it does is a write the drain needs to watch.
+    let result = opts.drain && !opts.dryRun
       ? await (await import('../../core/persistence/sync-drain.ts')).drainManagedSync(engine, opts, true)
       : await (await import('../../core/persistence/sync-run.ts')).performManagedSync(engine, opts);
     // #6349: a delta past the cursor bound syncs in stages; a drain takes the next stage from where the last one landed
@@ -134,17 +172,19 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
         ...(n ? { drain: { ...n, passes: d.passes + n.passes, processed: d.processed + n.processed, written: d.written + n.written, waived: d.waived + n.waived } } : {}) };
       if (!next.staged) serr(`[sync] staged catch-up reached HEAD after ${stages} stages.`);
     }
-    await printCursorAdoption(result, sourceId);
-    if (!opts.dryRun) await recordUpstreamObservation(engine, opts.sourceId ?? 'default', opts.repoPath);
-    if (!opts.dryRun && ['synced', 'first_sync', 'up_to_date'].includes(result.status)) await clearSettledFailures(engine, opts.sourceId ?? 'default');
-    if (!opts.dryRun) {
-      const replayed = await replayImportedRemembers(engine, opts.sourceId ?? 'default');
-      if (replayed) result = { ...result, replayedRemembers: replayed };
-      const ghosts = await reportSyncGhosts(engine, opts.sourceId ?? 'default');
-      if (ghosts) result = { ...result, ghostPages: ghosts };
-      // #6712 PR 2: holds that turned needs_human (or file_drift content decisions) since the last count, for the soak counters.
-      await (await import('../../core/persistence/soak-counters.ts')).sweepNeedsHumanHolds(engine, opts.sourceId ?? 'default').catch(() => undefined);
-    }
+    printInheritedOptions(result);
+    if (opts.dryRun) return result;
+    skips = (await import('../../core/persistence/sync-idle-skips.ts')).idleSkips(sourceId);
+    // GBRA-133: the ghost-page scan reads only pages and the source's config, so it runs beside the settles before it; its line still prints after theirs.
+    const ghostScan = countSyncGhosts(engine, sourceId);
+    await recordUpstreamObservation(engine, sourceId, opts.repoPath);
+    if (['synced', 'first_sync', 'up_to_date'].includes(result.status) && !skips.has('settled_failures')) await clearSettledFailures(engine, sourceId);
+    const replayed = await replayImportedRemembers(engine, sourceId);
+    if (replayed) result = { ...result, replayedRemembers: replayed };
+    const ghosts = reportSyncGhosts(await ghostScan);
+    if (ghosts) result = { ...result, ghostPages: ghosts };
+    // #6712 PR 2: holds that turned needs_human (or file_drift content decisions) since the last count, for the soak counters.
+    if (!skips.has('needs_human_sweep')) await (await import('../../core/persistence/soak-counters.ts')).sweepNeedsHumanHolds(engine, sourceId).catch(() => undefined);
     return result;
   };
   // A dry run reads and previews only; it never waits for, or keeps out, a drainer.
@@ -152,7 +192,8 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
   const { withSyncTail } = await import('../../core/persistence/sync-tail.ts');
   try {
     const { healOriginTwinsAfterManagedSync } = await import('../../core/repair/origin-twins-heal.ts');
-    return await healOriginTwinsAfterManagedSync(engine, outer, await (await import('../../core/repair/slug-autoheal.ts')).healAfterManagedSync(engine, outer, await withSyncTail(engine, sourceId, await withDrainLease(engine, sourceId, {
+    const { healAfterManagedSync } = await import('../../core/repair/slug-autoheal.ts');
+    const drained = await withDrainLease(engine, sourceId, {
       holder: outer.drainHolder ?? { kind: 'cli', id: null }, remote: currentSubmissionAuthority()?.kind === 'remote_generic',
       ...(outer.followDrainLease ? { follow: { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs } } : {}),
       tty: process.stderr.isTTY === true,
@@ -163,24 +204,26 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
           ? `[sync] source ${sourceId} is being drained by ${who}; following it until it finishes or this run's budget ends (one drainer per source; it resumes the same cursor). Ctrl-C stops following and leaves it running.`
           : `[sync] following ${who}: ${done}.`);
       },
-    }, work), { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs })));
+    }, work);
+    // GST-2492 (B2): a rule this sync applied moves the held facts it narrows now. It runs once the lease is released only so
+    // a follower sync does not wait on the move: the lease is re-entrant and the move's maintenance writes are not sync rows
+    // (no claim waits on the lease), so running it inside would not deadlock either.
+    const moves = await import('../../core/facts/held-fact-move.ts');
+    const held = currentDrainLease(sourceId) ? null : await moves.moveRuledSharedHeld(engine, sourceId)
+      .catch((error: unknown) => { serr(`[sync] held facts under a new folder rule wait for the next maintenance cycle: ${error instanceof Error ? error.message : String(error)}`); return null; });
+    for (const w of held ? moves.heldMoveIncomplete(held) : []) serr(`[sync] held facts moved under a new folder rule, incomplete: ${w.text}`);
+    if (held?.unmovable.length) serr(`[sync] ${held.unmovable.length} group(s) of held facts could not move yet; the next gbrain dream retries (gbrain repair facts-home --source ${sourceId} lists them).`);
+    const tailed = skips.has('sync_tail') ? drained : await withSyncTail(engine, sourceId, drained, { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs });
+    const healed = skips.has('slug_heal') ? tailed : await healAfterManagedSync(engine, outer, tailed);
+    return skips.has('origin_heal') ? healed : await healOriginTwinsAfterManagedSync(engine, outer, healed);
   } catch (err) {
     if (err instanceof LockUnavailableError && err.lockId === lockKey) throw new SyncLockBusyError(await formatLockBusyMessage(engine, lockKey), lockKey);
     throw err;
   }
 }
 
-/**
- * #6712 PR 1: the one-line notices of a resumed cursor. A run that finished another writer's (or another option set's)
- * unfinished run names that run's own options, and a kept opt-out names the command that settles what it skipped.
- */
-async function printCursorAdoption(result: SyncResult, sourceId: string): Promise<void> {
-  const adopted = result.cursorAdopted;
-  if (adopted?.sync_options !== undefined) {
-    const { managedSyncResumeArgs } = await import('../../core/sync-reconcile.ts');
-    serr(`[sync] resumed the unfinished sync run of source ${sourceId}${adopted.writer_changed ? ' that another writer started' : ''}; it finishes under its own frozen options `
-      + `(gbrain sync ${managedSyncResumeArgs({ sourceId, processingOptions: adopted.processing_options, syncOptions: adopted.sync_options }).join(' ')}), and the next run uses this run's.`);
-  }
+/** #6712 PR 1: the one-line notice of a kept opt-out, naming the command that settles what it skipped. */
+function printInheritedOptions(result: SyncResult): void {
   const kept = result.inherited_options ?? [];
   if (!kept.length) return;
   const flags = { noEmbed: '--no-embed', noExtract: '--no-extract', noSchemaPack: '--no-schema-pack' } as const;
@@ -211,8 +254,12 @@ async function replayImportedRemembers(engine: BrainEngine, sourceId: string): P
 }
 
 /** #6712 PR 2 (L4): the source's ghost pages (live pages whose file is gone), counted and named, never deleted by sync. */
-async function reportSyncGhosts(engine: BrainEngine, sourceId: string): Promise<SyncResult['ghostPages'] | null> {
-  const ghosts = await (await import('../../core/persistence/sync-ghosts.ts')).countSyncGhosts(engine, sourceId).catch(() => null);
+async function countSyncGhosts(engine: BrainEngine, sourceId: string): Promise<{ sourceId: string; ghosts: SyncResult['ghostPages'] | null }> {
+  return { sourceId, ghosts: await (await import('../../core/persistence/sync-ghosts.ts')).countSyncGhosts(engine, sourceId).catch(() => null) };
+}
+
+/** Prints the ghost-page line of a scan and returns its report. */
+function reportSyncGhosts({ sourceId, ghosts }: Awaited<ReturnType<typeof countSyncGhosts>>): SyncResult['ghostPages'] | null {
   if (ghosts) serr(`[sync] ${ghosts.count}${ghosts.truncated ? '+' : ''} live page(s) of ${sourceId} have no canonical file (ghost pages${ghosts.samples.length ? `, e.g. ${ghosts.samples.join(', ')}` : ''}); `
     + `sync leaves them in place. Preview with ${ghosts.fix.argv!.join(' ')} (read-only), or restore the files and sync.`);
   return ghosts;

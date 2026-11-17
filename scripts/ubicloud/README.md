@@ -14,7 +14,9 @@ matches an already-gated tree apart from the release stamp files needs no new
 gate). During development use `bun run ci:ubicloud:diff`, `--lanes` and
 targeted suites (`bun test --timeout=60000 <files>`). The gstack pregate remote stage
 (`scripts/pregate-remote-gate.sh`, `.gstack/pregate.json`'s `remote_gate`)
-runs the `:diff` form for the same reason. `:diff` narrows only doc-only
+runs the `:diff` form for the same reason, unless the clean tree already passed
+GitHub's full Test and E2E runs, when it reuses them and starts no VM
+([remote-gate reuse](../../docs/ci-event-parity.md#remote-gate-reuse)). `:diff` narrows only doc-only
 trees today (doc checks plus gitleaks); any other tree still runs every lane,
 so pick `--lanes` or targeted suites when the change is narrow. In a
 multi-lane wave, lanes run `ci:ubicloud:diff` or targeted suites, and only
@@ -22,29 +24,47 @@ the integrator runs the full gate.
 
 ## Ownership and teardown
 
-Every VM is named `ubirun-<owner>-<epoch>-<suffix>`, or
-`ubirun-<owner>-<epoch>-x<expiry epoch>-<suffix>` when it carries an expiry.
-The owner is `UBI_OWNER` (lowercased, letters and digits only, at most 12
-characters, starting with a letter) or a random per-machine id kept in the
-runner's state directory. Set `UBI_OWNER` to your thread code
-(`UBI_OWNER=gbra41 bun run ci:ubicloud`) so everyone can see whose VMs hold
-the quota. Ubicloud names allow 63 characters of `[a-z0-9-]`, so a full name
-stays under 52.
+`scripts/ubicloud/ubi-runner.sh` is gstack's runner, vendored (synced at gstack
+5532345a); its header lists gbrain's additions, which a sync keeps. Every VM
+the runner names is `ubirun-<owner>-<epoch>-<suffix>-t<H>`, gstack's runner
+grammar: its TTL ends H hours (1 to 999) after the creation epoch. The owner
+is `UBI_OWNER` (lowercased, letters and digits only, at most 12 characters,
+starting with a letter), and it is required: `up`, `run`, `verify`,
+`ci:ubicloud` and `scripts/pregate-remote-gate.sh` refuse without it, so no VM
+is created untagged (read-only commands fall back to a per-machine id). Set it
+to your thread code (`UBI_OWNER=gbra41 bun run ci:ubicloud`). Ubicloud names
+allow 63 characters of `[a-z0-9-]`, so a full name stays under 50.
 
-Ubicloud has no VM tags, so the expiry lives in the name. `ci:ubicloud` names
-every gate VM to expire two hours after creation (`--ttl-hours N` changes it,
-`--ttl-hours 0` means no expiry). `ubi-runner.sh up` and `run` take the same
-`--ttl-hours H`; without it their VMs never expire, which suits long dev,
-benchmark and eval VMs. `scripts/ubicloud/reap-expired.ts` is the operator
+Ubicloud has no VM tags, so the TTL lives in the name, and gstack's
+`ubi-runner.sh reap` reads the TTL of every name gbrain generates the same way. `ci:ubicloud` gives every gate VM a
+two-hour TTL (`--ttl-hours N` changes it, up to 999). `ubi-runner.sh up` and
+`run` take the same `--ttl-hours H`; without it their VMs get `UBI_TTL_HOURS`
+(gstack's default, 3 hours), so give a long dev, benchmark or eval VM
+`--ttl-hours` above its longest run. With `-n NAME`, `--ttl-hours H` appends
+`-t<H>`, and a `ubirun-` name without a TTL is refused (nothing could ever reap it).
+`ubi-runner.sh reap` destroys only the caller's own VMs: its `ubirun-<owner>-*`
+VMs whose TTL ended over ten minutes ago, and its TTL-less ones once they are
+`UBI_LEGACY_HOURS` (4) old. Another owner's expired VM, including one this machine
+created under a different tag (which `list --mine` and `gc` do cover), is only counted in reap's
+log; `reap-expired.ts` is the operator reaper that destroys expired VMs of every owner. gstack's `up` runs that reap first; gbrain's copy
+does only with `UBI_REAP=1` (or `true`, `yes`, `on`; `0`, `false`, `no` and `off`
+turn it off, and any other value is refused), and logs one `reap skipped` line otherwise, until
+gbrain's TTL-less VMs older than four hours are gone. `run`, `verify` and
+`ci:ubicloud` end with gstack's leftover line, `UBICLOUD: left=<n> owner=<owner> ...`
+(also appended to `UBI_LEFT_FILE`), counting their own VMs still in the
+project's list after teardown; anything but `left=0` fails a run that would
+otherwise pass, and `scripts/pregate-remote-gate.sh` treats it, or a missing
+line, as `PREGATE_REMOTE_INFRA` (exit 4, no receipt). `scripts/ubicloud/reap-expired.ts` is the operator
 side of the leak guard: run from the operator's Capy automation, where the
 Ubicloud token already lives (never from GitHub Actions), it lists the project's
-VMs, selects only names in the expiring format whose expiry plus a 15-minute
-grace has passed, and prints each `ubirun-*` VM's owner, age, expiry and action
+VMs, selects only names with a TTL (or the older
+`ubirun-<owner>-<epoch>-x<expiry epoch>-<suffix>` form, until none are left)
+whose expiry plus a 15-minute grace has passed, from any owner or tool, and prints each `ubirun-*` VM's owner, age, expiry and action
 plus an owner-notice block (expired VMs grouped by owner and the thread code
 the owner tag names). It is a dry run unless given `--apply`, which destroys
 each expired VM through `ubi-runner.sh down`, and it refuses the whole run when
 more than `--max` (40) VMs are expired. It never selects an owner-tagged name
-without an expiry, a legacy untagged `ubirun-<epoch>-*` name or a VM the
+without a TTL, a legacy untagged `ubirun-<epoch>-*` name or a VM the
 runner did not name, whoever owns it.
 
 Each name is recorded before its create request is sent: the runner writes
@@ -55,8 +75,11 @@ operation), an `up` still talking to the API finishes the request and destroys
 its own VM; further signals are ignored until teardown ends. Then every recorded name gets `down`, which destroys the VM and polls
 until it is confirmed gone. A create whose answer never arrived is waited out
 for `UBI_CREATE_GRACE` seconds (default 180) before the VM counts as never
-created. `down` gives up after `UBI_DOWN_TIMEOUT` seconds (default 900) and
-prints the command to rerun.
+created. A destroy request that times out or gets a 5xx (or 408, 429, 404) is
+retried on the next poll; another 4xx fails at once. `down` gives up after
+`UBI_DOWN_TIMEOUT` seconds (default 900), naming the last destroy status, and
+prints the command to rerun. `reap` waits at most `UBI_REAP_DOWN_TIMEOUT`
+seconds (default 180) for each VM.
 
 Nothing sweeps stale VMs unless you ask. With `UBI_GC_HOURS` set to a positive
 number, each `up` first destroys the caller's own VMs older than that many
@@ -72,7 +95,10 @@ operation so the machine stays awake. After any interrupted run, check
 destroys your own VMs older than HOURS). A gate VM nobody reaps still dies
 once its expiry passes and the operator reaper next runs with `--apply`.
 
-`ubi-runner.sh list --mine` lists your VMs. `ubi-runner.sh usage` prints VMs
+`ubi-runner.sh list --mine` lists your VMs: those tagged with your owner tag
+and every VM this machine created under any tag (its local state stays until
+`down` confirms it gone), so a run started with a different `UBI_OWNER` is still
+listed; stderr names the tags it covered. `ubi-runner.sh usage` prints VMs
 and vCPUs per owner across the project, which shows who holds the shared quota.
 
 Each VM runs `scripts/ubicloud/setup-ci-vm.sh`: the pinned Bun from
@@ -143,7 +169,7 @@ runs every file in `test/postgres-unit-arms.txt` the way persistence-validation'
 `unit-postgres-arms` step does (`bun --no-env-file test --timeout=120000`,
 `GBRAIN_TEST_ALLOW_DATABASE_URL=1`, no timeout multiplier) against the slot's
 own empty `gbrain_arms_test` database. The summary takes the two-worker makespan of its
-measured durations over that job's `ARM_SHARDS` partition (11 shards, `ARM_WORKERS` = 2
+measured durations over that job's `ARM_SHARDS` partition (22 shards, `ARM_WORKERS` = 2
 files at a time), and a shard over the step's 20-minute timeout
 fails the run, since GitHub would cut that shard off mid-list. The committed
 weights must also fit each shard twice over with a minute to spare
@@ -179,7 +205,7 @@ VM). The decision is logged (`fleet: project VMs hold 192 vCPUs, ceiling 448:
 10 VM(s) × 16 vCPUs (burst maximum 10)`). The 64 vCPUs above the ceiling are
 headroom for the managed GitHub runners `usage` can't see. When usage can't
 be read, or the project is busy, the run takes the default. Slots default to
-one per two vCPUs (`--slots`); `--size` picks the VM shape. A full gate runs only in
+three per eight vCPUs (`--slots`, six on a standard-16); `--size` picks the VM shape. A full gate runs only in
 `eu-central-h1` (the default `--location`): test timeouts and the mined shard weights are calibrated on
 its VMs, and on 2026-10-19 two full gates in `us-east-a2` ran about half as fast and timed out tests that
 pass there. Another `--location` is refused unless `--lanes` names a diagnostic subset, whose summary
@@ -192,15 +218,19 @@ at the pull-request scale (`GBRAIN_TEST_EXPORT_SCALE_PAGES=10001`). `--lanes` ru
 subset, `--keep` leaves the VMs up for debugging, and `--diff` follows
 `ci:local:diff` (a doc-only diff runs the doc checks and gitleaks alone).
 
-A full gate is about 16,000 seconds of test compute at 8 slots per VM, and
+A full gate is about 35,000 seconds of test compute at 6 slots per VM, and
 the heaviest-first queue keeps every slot busy almost to the end, so wall
 time is setup plus compute divided by slots. No single file runs much past
 three minutes: the former long poles are split into files of about two
 minutes (`graduation-cli*`, `graduation-crash-*`, `graduation-clients*`,
 `reconcile-crash-*.slow`, `write-attribution-timeline-10k-postgres`), and the
 longest single test left is the 1k-page graduation round trip (about 150
-seconds). More slots per VM do not help: on eight VMs, 12 slots raised
-compute 27% (unit 27%, E2E 25%, serial 31%) and finished in 353 seconds
-against 359 at 8 slots, and 16 slots raised it 52% and took 444 seconds.
-Neither produced a failure, but the extra contention buys no wall time, so 8
-slots (one per two vCPUs) stays the default and bursts add VMs instead.
+seconds). Slots are sized by load, not by vCPU count alone. Each slot's bun process, its child
+processes and its own PostgreSQL and PgBouncer keep about 2.5 threads runnable, so on
+2026-10-20 one slot per two vCPUs (8 on standard-16) measured a 1-minute load of 1.11 per
+vCPU at p50 and 1.39 at p90, ran 45,565 s of test compute and timed out
+`persistence-sync-options-parity` on its PgBouncer pass. Six slots on the same tree
+measured 0.79 and 0.95, ran 35,393 s (22% less) and passed; at eight VMs that is about
+the same wall time. Every gate prints this load line, and warns when p90 passes 1.1:
+test timeouts, `run-e2e.sh`'s per-file cap and the mined shard weights assume a VM
+that is not oversubscribed. More slots do not buy wall time; bursts add VMs instead.

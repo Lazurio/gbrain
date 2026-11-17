@@ -43,6 +43,15 @@ const FIXTURES_DIR = resolve(import.meta.dir, 'fixtures');
 let engine: PostgresEngine | null = null;
 
 const ALL_TABLES = [
+  // Per-member read access (members, groups, folder rules): a member left behind makes every later file's brain restricted.
+  'access_group_members',
+  'access_groups',
+  'access_members',
+  'access_pending_coverage',
+  'access_rules',
+  'access_policy_revisions',
+  'access_policy_migrations',
+  'access_policy_state',
   // C4 pinned questions: no FKs (pointers only); cleared so pins never leak across files.
   'question_evidence',
   'pinned_questions',
@@ -218,6 +227,17 @@ export async function setupLegacyEmbeddingDB(): Promise<PostgresEngine> {
     await tx.setConfig('embedding_dimensions', String(dims));
   });
   return target;
+}
+
+/**
+ * Delete the access members a file added. Two or more enabled members make the
+ * shared brain serve several people, and every later file's unbound remote
+ * reads are then refused with requester_scope_required. Deleting (not
+ * disabling) fires the serves trigger, which writes access.serves_derived
+ * back to one. Call in afterAll() before teardownDB().
+ */
+export async function removeMembers(ids: readonly string[]): Promise<void> {
+  await engine?.executeRaw('DELETE FROM access_members WHERE id = ANY($1::text[])', [ids]);
 }
 
 /**

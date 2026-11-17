@@ -30,6 +30,7 @@ import { loadConfig } from '../config.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../types.ts';
 import { ORPHANED_ALIAS_COUNTS_SQL, SOFT_DELETED_ALIAS_COUNT_SQL } from '../repair/aliases.ts';
 import { repairPreviewCommand } from '../repair/registry.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 
 /** Shared shape returned by all four checks. */
 export interface OnboardCheckResult {
@@ -161,7 +162,7 @@ async function sampleVisibleEntityCoverage(
   sampleClause: string,
   feature: CoverageFeature,
   filter: EntityTypeFilter,
-): Promise<EntityCoverageSample> {
+): Promise<EntityCoverageSample | { error: string }> {
   try {
     const sql = visibleEntityCoverageSql(feature, filter, sampleClause);
     const result = await engine.executeRaw(sql.text, sql.params);
@@ -175,9 +176,15 @@ async function sampleVisibleEntityCoverage(
     // impossible percentages or feed a negative value into sqrt().
     const matched = Math.min(sampleSize, finiteCount(row.matched));
     return { matched, sampleSize };
-  } catch {
-    return { matched: 0, sampleSize: 0 };
+  } catch (error) {
+    return { error: redactConnectionInfo(error instanceof Error ? error.message : String(error)) };
   }
+}
+
+/** #7145: a coverage read that failed or sampled no row measured nothing, so it is not "0% coverage". */
+function unmeasuredCoverage(name: string, sample: EntityCoverageSample | { error: string }): OnboardCheckResult {
+  const why = 'error' in sample ? `the coverage read failed (${sample.error})` : 'the sampled read returned no entity page';
+  return { check: { name, status: 'warn', message: `Coverage unknown: ${why}; rerun doctor.`, details: { health: 'unknown', reason: 'error' in sample ? 'error' : 'empty_sample' } }, remediations: [] };
 }
 
 function coverageWithConfidence(sample: EntityCoverageSample): { coverage: number; ci: number } {
@@ -341,6 +348,7 @@ export async function checkEntityLinkCoverage(
     LINK_COVERAGE_FEATURE,
     entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('entity_link_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
 
   const pct = Math.round(coverage * 100);
@@ -422,6 +430,7 @@ export async function checkTimelineCoverage(
     TIMELINE_COVERAGE_FEATURE,
     entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('timeline_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
   const pct = Math.round(coverage * 100);
   const ciPct = (ci * 100).toFixed(1);
@@ -655,6 +664,16 @@ export async function checkPackUpgradeAvailable(
   }
 }
 
+const PAGE_TYPE_PAIRS_SQL = `WITH RECURSIVE pairs AS (
+  (SELECT source_id, type FROM pages WHERE deleted_at IS NULL AND type IS NOT NULL ORDER BY source_id, type LIMIT 1)
+  UNION ALL
+  SELECT n.source_id, n.type FROM pairs, LATERAL (
+    SELECT p.source_id, p.type FROM pages p
+     WHERE p.deleted_at IS NULL AND p.type IS NOT NULL AND (p.source_id, p.type) > (pairs.source_id, pairs.type)
+     ORDER BY p.source_id, p.type LIMIT 1) n
+)
+SELECT source_id, type FROM pairs`;
+
 /**
  * type_proliferation (D16): pack-aware ratio. Warns when distinct typed
  * pages exceed pack-declared types + 5; fails at declared × 2. No false
@@ -665,6 +684,9 @@ export async function checkPackUpgradeAvailable(
  * DB config included); sources sharing a pack pool their labels, and an
  * alias counts as its canonical type. A source whose pack does not resolve,
  * or a failed query, is "not verified" (warn), never ok.
+ *
+ * The (source, type) pairs are read by a skip scan over idx_pages_source_type
+ * (v316): one index probe per distinct pair, never a pass over every page.
  */
 export async function checkTypeProliferation(
   engine: BrainEngine,
@@ -673,8 +695,7 @@ export async function checkTypeProliferation(
     ({ check: { name: 'type_proliferation', status, message }, remediations: [] });
   let rows: Array<{ source_id: string; type: string }>;
   try {
-    rows = await engine.executeRaw<{ source_id: string; type: string }>(
-      `SELECT DISTINCT source_id, type FROM pages WHERE deleted_at IS NULL AND type IS NOT NULL ORDER BY source_id, type`);
+    rows = await engine.executeRaw<{ source_id: string; type: string }>(PAGE_TYPE_PAIRS_SQL);
   } catch (e) {
     return result('warn', `type_proliferation not verified: the page type query failed (${(e as Error).message}).`);
   }
@@ -746,7 +767,13 @@ export async function checkDanglingAliases(
     orphaned = await engine.executeRaw(ORPHANED_ALIAS_COUNTS_SQL);
     const [row] = await engine.executeRaw<typeof soft>(SOFT_DELETED_ALIAS_COUNT_SQL);
     if (row) soft = row;
-  } catch { /* pre-v105 brain or unreadable alias tables: nothing to report */ }
+  } catch (error) {
+    // #7145: only a pre-v105 brain (no alias tables) has nothing to report; any other failure is unknown, not clear.
+    if (!isMissingSchemaObject(error, 'table', ['slug_aliases', 'page_aliases'])) {
+      return { check: { name: 'dangling_aliases', status: 'warn', details: { health: 'unknown' },
+        message: `Dangling aliases unknown: the alias read failed (${redactConnectionInfo(error instanceof Error ? error.message : String(error))}); rerun doctor.` }, remediations: [] };
+    }
+  }
   const slugAliases = orphaned.reduce((sum, row) => sum + Number(row.slug_redirects), 0) + Number(soft.slug_redirects);
   const pageAliases = orphaned.reduce((sum, row) => sum + Number(row.page_aliases), 0) + Number(soft.page_aliases);
   const n = slugAliases + pageAliases;

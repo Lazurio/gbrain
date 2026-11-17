@@ -52,8 +52,11 @@ export class SharedParameterTypes extends Map<string, number[]> {
   }
 
   override set(key: string, types: number[]): this {
+    const hashed = digest(key);
+    const known = super.get(hashed);
+    if (known && known.length === types.length && known.every((type, i) => type === types[i])) return this;
     if (super.size >= MAX_ENTRIES) return this;
-    super.set(digest(key), types);
+    super.set(hashed, types);
     this.changed();
     return this;
   }
@@ -166,7 +169,29 @@ export function loadSharedParameterTypes(url: string, serverVersion: string, sch
   return added;
 }
 
+/**
+ * #6930: the array types (`pg_type` element/array pairs, extension types included) the first connection to a
+ * database target fetched in this process. Every pool for that target shares the object, so later connections, of any
+ * pool, skip the pg_type round trip. Kept in this process only: extension type OIDs belong to one database's catalog.
+ * `GBRAIN_PG_TYPE_CACHE=0` turns it off (each connection fetches, the driver's stock behaviour).
+ */
+export interface SharedArrayTypes { rows: Array<[number, number]> | null }
+const arrayTypesByTarget = new Map<string, SharedArrayTypes>();
+
+export function sharedArrayTypes(url: string | undefined): SharedArrayTypes | null {
+  if (envOff('GBRAIN_PG_TYPE_CACHE')) return null;
+  if (!url) return { rows: null };
+  const target = typeCacheTarget(url);
+  let store = arrayTypesByTarget.get(target);
+  if (!store) {
+    store = { rows: null };
+    arrayTypesByTarget.set(target, store);
+  }
+  return store;
+}
+
 export function _resetSharedParameterTypesForTests(): void {
   for (const store of byTarget.values()) store.scope = null;
   byTarget.clear();
+  arrayTypesByTarget.clear();
 }

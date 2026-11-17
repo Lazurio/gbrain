@@ -25,7 +25,7 @@ import { FRONTMATTER_HEAD_MAX_BYTES, readPageBodyPolicy, type PageBodyPolicy } f
 import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { getWorktreeBinding } from './ownership.ts';
-import { localHostId } from './identity.ts';
+import { hostIdFor } from './identity.ts';
 import { sha256 } from './digest.ts';
 import { screeningPath } from './screening-paths.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
@@ -37,6 +37,8 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { bindOrigin } from './origin-guard.ts';
+import { segmentedOutcome } from './searchable.ts';
+import { isQuarantined } from '../quarantine.ts';
 
 export type ImportPack = { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
 /** A Markdown file over the single-string ceiling, journaled by reference: the preparer streams and verifies it (Wave B). */
@@ -88,6 +90,8 @@ function managedImportRefusal(refusal: ContentRefusal, sourcePath: string): Oper
     : refusal.code === 'file_too_large' ? `${sourcePath} is over the size limit the message names and was not imported. Every page under the limit imports and is searchable; leave this file out of the import, or split it into files under the limit.`
     : refusal.code === 'content_rejected' ? `Remove the matched junk from ${sourcePath}, then import it again.`
     : refusal.code === 'write_gate_rejected' ? `The write gate refuses ${sourcePath} (external instruction-like content under write_gate.external_mode=reject); tell the user, the decision is theirs.`
+    : refusal.code === 'visibility_noncanonical' ? `Write visibility: private on its own frontmatter line of ${sourcePath} (lowercase key and value), then import it again.`
+    : refusal.code === 'tag_too_long' ? `Shorten the tag the message names in ${sourcePath}, or split it into shorter tags, then import it again.`
     : `Fix line ${refusal.line ?? '?'} of ${sourcePath}${refusal.key ? ` (key "${refusal.key}")` : ''}: one line per key with its whole value quoted. Run gbrain frontmatter validate on the file to see every problem, then import it again.`;
   return contentRefusalError(refusal, suggestion, { legacy_error: 'invalid_params' });
 }
@@ -111,7 +115,7 @@ export function managedImportContent(sourcePath: string, bytes: Buffer, activePa
   if (isCodeFilePath(sourcePath)) return { slug: slugifyCodePath(sourcePath), content };
   if (!/\.mdx?$/i.test(sourcePath)) throw opError('invalid_params', 'Managed import supports Markdown, code and supported image files.',
     `${sourcePath} is not a Markdown (.md, .mdx), code or supported image file, so it was not imported. Convert it to Markdown or leave it out.`);
-  const screen = screenImportContent({ content, path: sourcePath, byteLength: bytes.length, expectedSlug: slugifyPath(sourcePath), fences: 'coordinated',
+  const screen = screenImportContent({ content, path: sourcePath, byteLength: bytes.length, expectedSlug: slugifyPath(sourcePath), fences: 'coordinated', holdNoncanonicalPrivate: true,
     slugConflictMessage: (found, expected) => `Frontmatter slug "${found}" does not match path-derived slug "${expected}".` });
   if (screen.status === 'refused') throw managedImportRefusal(screen.refusal, sourcePath);
   content = applyInference(sourcePath, content).content;
@@ -165,7 +169,7 @@ export async function assertImportPaths(engine: BrainEngine, sourceId: string, r
   const sources = await engine.executeRaw<{ id: string; local_path: string | null; worktree_path: string | null; relative_path: string | null }>(
     `SELECT s.id,s.local_path,h.local_path AS worktree_path,b.relative_path FROM sources s
       LEFT JOIN persistence_source_bindings b ON b.source_id=s.id AND b.source_incarnation=s.incarnation
-      LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid WHERE NOT s.archived`, [localHostId()]);
+      LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid WHERE NOT s.archived`, [hostIdFor(engine)]);
   for (const source of sources) {
     if (source.id === sourceId) continue;
     const roots = [source.local_path, source.worktree_path && source.relative_path !== null ? join(source.worktree_path, source.relative_path) : null];
@@ -251,7 +255,7 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
     ? await importImageFile(engine, p.inputPath, p.sourcePath, { ...source, noEmbed: p.noEmbed, bytes: imageBytes, prepare })
     : code
     ? await importCodeFile(engine, p.sourcePath, content, { ...source, noEmbed: true, prepare })
-    : await importFromContent(engine, row.slug, content, { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, prepare, fences: 'coordinated', writeGate: await ownerGateInput(engine, row, parseMarkdown(content, row.slug).frontmatter, p.sourcePath),
+    : await importFromContent(engine, row.slug, content, { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, prepare, fences: 'coordinated', boundedChunkWrites: true, writeGate: await ownerGateInput(engine, row, parseMarkdown(content, row.slug).frontmatter, p.sourcePath),
       coordinated: true, existingSnapshot: snapshot, activePack: p.activePack, sourcePath: p.sourcePath, filename: basename(p.sourcePath, '.md'), allowEmptyOverwrite: true,
       segmentedOwner: { kind: 'import', principalKind: row.principal_kind, principalId: row.principal_id, baseRevision: snapshot?.revision ?? null } });
   if (!prepared && result.refusal?.code === 'invalid_fence') throw managedImportRefusal(result.refusal, p.sourcePath);
@@ -288,12 +292,13 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
           await project(tx, final?.page.id);
           if (applied?.segmented) { if (applied.segmented.complete && live) await sealSegmentedPage(tx, Number(live.page.id)); }
           else if (applied?.chunkerSeal !== undefined) await sealImportedPage(tx, row.slug, row.source_id, live, applied.chunkerSeal, applied.pageId);
-          else if (live) await sealPageTextProjection(tx, row.slug, row.source_id, live);
+          else if (live && !applied?.projectionPending) await sealPageTextProjection(tx, row.slug, row.source_id, live);
         }
         mutation.postimage = final;
-      } else if (!ready.noop && !image) await sealPageTextProjection(tx, row.slug, row.source_id);
+      } else if (!ready.noop && !image && !applied?.projectionPending) await sealPageTextProjection(tx, row.slug, row.source_id);
       // #6188: the canonical file is written from the normalized page; the outcome reports what Tier 1 rewrote.
-      return { ...result, parsedPage: undefined, imported_file: true, source_id: row.source_id, fences_normalized: result.fences_normalized?.length
+      return { ...result, parsedPage: undefined, imported_file: true, source_id: row.source_id,
+        ...(ready.noop ? {} : segmentedOutcome(applied?.segmented, isQuarantined(ready.parsedPage?.frontmatter ?? {}))), fences_normalized: result.fences_normalized?.length
         ? pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: result.fences_normalized, writer: row.principal_kind, path: p.sourcePath, remote: false }) : undefined };
     } };
   return mutation;
@@ -351,9 +356,9 @@ async function prepareStreamedManagedImport(engine: BrainEngine, row: WriteReque
     validate: async tx => { await checkPlacement(tx); await prepared.validate(tx); },
     ...(prepared.afterCommit ? { afterCommit: prepared.afterCommit } : {}),
     apply: async tx => {
-      await prepared.apply(tx);
+      const applied = await prepared.apply(tx);
       mutation.postimage = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
-      return { ...result, imported_file: true, source_id: row.source_id };
+      return { ...result, imported_file: true, source_id: row.source_id, ...segmentedOutcome(applied?.segmented, isQuarantined(prepared.frontmatter)) };
     } };
   return mutation;
 }

@@ -37,7 +37,7 @@ import { credentialSafeProjection } from '../credential-projection.ts';
 import { loadFenceChunkOverlay, markFenceChunk, renderFenceLowTier, type FenceChunkOverlay, type FenceLowTierRow } from '../eligibility/fence-overlay.ts';
 import { partialFenceRuns, withdrawalFenceBlocks } from '../facts/withdrawal-overlay.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END } from '../facts-fence.ts';
-import { assertRowsTile, generationBodyBytes } from './body-tiling.ts';
+import { assertRowsTile, generationBodyBytes, LIVE_READ_ATTEMPTS } from './body-tiling.ts';
 import { readEntryState } from './entry-state.ts';
 import { FENCE_MAX_BYTES, SEGMENT_MAX_BYTES } from './limits.ts';
 import { ledgerApplies, readBodyLedger, overlaySegmentText, type BodyLedger } from './segment-ledger.ts';
@@ -170,22 +170,40 @@ async function checkPin(pin: BodyPin, page: Record<string, unknown> | undefined,
   await pin.admit?.();
 }
 
+/** A generation's manifest rows, each carrying the generation read (`generation` null: the page's live one at the statement). */
+function manifestRows(engine: BrainEngine, pageId: number, generation: number | null): Promise<Record<string, unknown>[]> {
+  return engine.executeRaw<Record<string, unknown>>(`SELECT m.seq, m.occurrence_id, m.region, m.sha256, m.byte_start, m.byte_len,
+      m.line_start, m.line_count, m.static_proj_bytes, m.static_proj_lines, jsonb_array_length(m.outline) AS outline_count,
+      jsonb_array_length(m.facts_slots) > 0 AS has_facts, m.date_min IS NOT NULL AS has_date, g.generation
+    FROM (SELECT COALESCE($2::bigint, (SELECT body_generation FROM pages WHERE id=$1)) AS generation) g
+    JOIN page_body_manifest m ON m.page_id=$1 AND m.staging_id IS NULL AND m.gen_from<=g.generation AND (m.gen_to IS NULL OR m.gen_to>g.generation)
+    ORDER BY m.seq`, [pageId, generation]);
+}
+
 /**
  * Open a segmented body. With `pin` the read is the authorized one: the page must still be at the pinned revision (and
  * generation), the caller's admission is re-run, and the rows read are that generation's.
+ *
+ * The page row, the manifest rows and (given `expect`, the slug and source the caller already holds) the ledger are
+ * read at once: rows read for another generation than the page row names (a body published between the statements)
+ * are read again, and a ledger read under a name the page row does not carry is read again under its own. A live read
+ * whose generation a publish retired before its rows were read (they no longer tile it) opens the new live generation,
+ * up to LIVE_READ_ATTEMPTS times (GBRA-287).
  */
-export async function openSegmentedBody(engine: BrainEngine, opts: { pageId: number; generation?: number; ledger?: BodyLedger; pin?: BodyPin }): Promise<SegmentedBody> {
-  const [page] = await engine.executeRaw<Record<string, unknown>>(`SELECT id, source_id, slug, body_storage, body_generation, body_bytes, body_lines, truth_bytes,
-      body_flags, segmenter_version, knowledge_revision::text AS revision FROM pages WHERE id=$1`, [opts.pageId]);
+export async function openSegmentedBody(engine: BrainEngine, opts: { pageId: number; generation?: number; ledger?: BodyLedger; pin?: BodyPin;
+  expect?: { slug: string; sourceId: string } }, attempt = 1): Promise<SegmentedBody> {
+  const requested = opts.pin?.generation ?? opts.generation ?? null;
+  const [[page], read, expected] = await Promise.all([
+    engine.executeRaw<Record<string, unknown>>(`SELECT id, source_id, slug, body_storage, body_generation, body_bytes, body_lines, truth_bytes,
+      body_flags, segmenter_version, knowledge_revision::text AS revision FROM pages WHERE id=$1`, [opts.pageId]),
+    manifestRows(engine, opts.pageId, requested),
+    opts.ledger || !opts.expect ? undefined : readBodyLedger(engine, opts.expect.sourceId, opts.expect.slug),
+  ]);
   if (opts.pin) await checkPin(opts.pin, page, opts.pageId);
-  const generation = opts.pin?.generation ?? opts.generation ?? Number(page?.body_generation);
+  const generation = requested ?? Number(page?.body_generation);
   // An earlier generation (a segmented version) keeps its manifest rows after the page was demoted to inline storage.
   if (!page || (page.body_storage !== 'segmented' && generation === Number(page.body_generation))) throw new Error(`Page ${opts.pageId} is not a segmented page.`);
-  const rows = await engine.executeRaw<Record<string, unknown>>(`SELECT m.seq, m.occurrence_id, m.region, m.sha256, m.byte_start, m.byte_len,
-      m.line_start, m.line_count, m.static_proj_bytes, m.static_proj_lines, jsonb_array_length(m.outline) AS outline_count,
-      jsonb_array_length(m.facts_slots) > 0 AS has_facts, m.date_min IS NOT NULL AS has_date
-    FROM page_body_manifest m
-    WHERE m.page_id=$1 AND m.staging_id IS NULL AND m.gen_from<=$2 AND (m.gen_to IS NULL OR m.gen_to>$2) ORDER BY m.seq`, [opts.pageId, generation]);
+  const rows = requested === null && Number(read[0]?.generation) !== generation ? await manifestRows(engine, opts.pageId, generation) : read;
   const slug = String(page.slug);
   const sourceId = String(page.source_id);
   const bodyRows = rows.map(r => ({
@@ -193,8 +211,15 @@ export async function openSegmentedBody(engine: BrainEngine, opts: { pageId: num
     byteStart: Number(r.byte_start), byteLen: Number(r.byte_len), lineStart: Number(r.line_start), lineCount: Number(r.line_count), staticProjBytes: Number(r.static_proj_bytes),
     staticProjLines: Number(r.static_proj_lines), outlineCount: Number(r.outline_count), hasFacts: r.has_facts === true, hasDate: r.has_date === true,
   }));
-  assertRowsTile(bodyRows, { slug, sourceId, total: await generationBodyBytes(engine, { id: opts.pageId, body_generation: page.body_generation, body_bytes: page.body_bytes }, generation) });
-  const ledger = opts.ledger ?? await readBodyLedger(engine, sourceId, slug);
+  try {
+    assertRowsTile(bodyRows, { slug, sourceId, total: await generationBodyBytes(engine, { id: opts.pageId, body_generation: page.body_generation, body_bytes: page.body_bytes }, generation) });
+  } catch (error) {
+    if (requested !== null || attempt >= LIVE_READ_ATTEMPTS) throw error;
+    const [now] = await engine.executeRaw<{ body_generation: unknown }>('SELECT body_generation FROM pages WHERE id=$1', [opts.pageId]);
+    if (!now || Number(now.body_generation) === generation) throw error;
+    return openSegmentedBody(engine, opts, attempt + 1);
+  }
+  const ledger = opts.ledger ?? (expected && opts.expect!.slug === slug && opts.expect!.sourceId === sourceId ? expected : await readBodyLedger(engine, sourceId, slug));
   return {
     pageId: opts.pageId, sourceId, slug, generation, bodyBytes: Number(page.body_bytes ?? 0), bodyLines: Number(page.body_lines ?? 0), truthBytes: Number(page.truth_bytes ?? 0),
     flags: (toJson(page.body_flags) ?? {}) as JsonObject, ledger, stale: Number(page.segmenter_version) !== SEGMENTER_VERSION, ...(opts.pin ? { pin: opts.pin } : {}),
@@ -218,17 +243,18 @@ interface LoadedSegment {
   mismatch: boolean;
 }
 
-/** The rows' texts and JSON metadata, one text at a time (metadata in batches). */
+/** The rows' texts and JSON metadata, one text at a time (metadata in batches, read alongside the batch's first text). */
 async function* loadSegments(engine: BrainEngine, body: SegmentedBody, rows: readonly BodyRow[], stop?: () => void): AsyncIterable<LoadedSegment> {
+  const readText = (row: BodyRow) => { stop?.(); return engine.readSegmentTexts(body.sourceId, [row.sha256]); };
   for (let at = 0; at < rows.length; at += HEAVY_BATCH) {
     const batch = rows.slice(at, at + HEAVY_BATCH);
-    const meta = new Map((await engine.executeRaw<Record<string, unknown>>(`SELECT occurrence_id, entry_state, protected_regions
+    const [first, metaRows] = await Promise.all([readText(batch[0]!), engine.executeRaw<Record<string, unknown>>(`SELECT occurrence_id, entry_state, protected_regions
       FROM page_body_manifest WHERE page_id=$1 AND occurrence_id=ANY($2::bigint[]) AND staging_id IS NULL AND gen_from<=$3 AND (gen_to IS NULL OR gen_to>$3)`,
-    [body.pageId, batch.map(r => r.occurrenceId), body.generation])).map(m => [Number(m.occurrence_id), m]));
-    for (const row of batch) {
-      stop?.();
+    [body.pageId, batch.map(r => r.occurrenceId), body.generation])]);
+    const meta = new Map(metaRows.map(m => [Number(m.occurrence_id), m]));
+    for (const [i, row] of batch.entries()) {
       const m = meta.get(row.occurrenceId);
-      const bytes = (await engine.readSegmentTexts(body.sourceId, [row.sha256])).get(Buffer.from(row.sha256).toString('hex'));
+      const bytes = (i === 0 ? first : await readText(row)).get(Buffer.from(row.sha256).toString('hex'));
       if (!m || bytes === undefined) throw projectionStaleError(row.byteStart, 'its manifest row or text is missing');
       yield {
         row, bytes, entryState: toJson(m.entry_state), protectedRegions: (toJson(m.protected_regions) ?? []) as StoredRegion[],
@@ -366,6 +392,18 @@ export function projectedUnits(body: SegmentedBody, layout: ProjectedLayout): Un
   return out;
 }
 
+/**
+ * Whether text the read projection hides or rewrites starts before `end` (read-view bytes, or stored bytes): a row whose
+ * projection is not its stored bytes or that holds facts, the low-tier block, or (stored) a timeline the view omits.
+ * Stored offsets past such text would measure it for a remote caller (get_page edit_target, edit_page `within`).
+ */
+export async function hiddenBefore(engine: BrainEngine, body: SegmentedBody, end: number, space: 'projected' | 'stored'): Promise<boolean> {
+  const layout = await projectedLayout(engine, body);
+  if (space === 'stored' && layout.timelineByte < 0 && body.bodyBytes > body.truthBytes && end > body.truthBytes) return true;
+  return projectedUnits(body, layout).some(u => (space === 'projected' ? u.start : u.kind === 'row' ? body.rows[u.index]!.byteStart : u.storedStart) < end
+    && (u.kind === 'text' ? u.text !== TIMELINE_SEPARATOR : layout.rowBytes[u.index] !== body.rows[u.index]!.byteLen || body.rows[u.index]!.hasFacts));
+}
+
 const unitBytes = (u: Unit, layout: ProjectedLayout) => u.kind === 'row' ? layout.rowBytes[u.index]! : Buffer.byteLength(u.text, 'utf8');
 
 /** One segment of the trusted body: its row, its stored bytes and entry state, and its text after the withdrawal overlay in pieces. */
@@ -398,7 +436,7 @@ const MARKER_CARRY_MAX = Math.max(FACTS_FENCE_BEGIN.length, FACTS_FENCE_END.leng
 export function markerCarry(text: string): string {
   for (let k = Math.min(text.length, MARKER_CARRY_MAX); k > 0; k--) {
     const tail = text.slice(-k);
-    if (FACTS_FENCE_BEGIN.startsWith(tail) || FACTS_FENCE_END.startsWith(tail)) return tail;
+    if ((k < FACTS_FENCE_BEGIN.length && FACTS_FENCE_BEGIN.startsWith(tail)) || (k < FACTS_FENCE_END.length && FACTS_FENCE_END.startsWith(tail))) return tail;
   }
   return '';
 }

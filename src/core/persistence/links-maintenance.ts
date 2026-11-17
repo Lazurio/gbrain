@@ -4,6 +4,7 @@ import { isQuarantined } from '../quarantine.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { preparationConfigView } from './config-snapshot.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { yieldToEventLoop } from './journal.ts';
 import { maintenanceAttribution } from './attribution.ts';
 import { storedCanonicalTimeline, unrecordedCanonicalTimeline } from './canonical-projections.ts';
 import { runMentionPass, type MentionPassResult } from '../mentions/pass.ts';
@@ -16,6 +17,8 @@ import { clearLinkExtractionHolds, linkExtractionRetryFix, recordLinkExtractionF
 export type { LinkExtractionFailure };
 
 export interface ManagedLinkExtraction { pages: number; created: number; removed: number; timeline: number; skipped: number; remaining: number;
+  /** #6820: of `skipped`, the pages skipped for unresolved attendance (the rest changed while the run read them). */
+  attendance_skipped?: number;
   /** The mention pass (absent when the caller ran links only, as sync does). */
   mentions?: MentionPassResult; mention_due?: number; mention_last_pass_at?: string | null;
   /** #6803 (D3): the terminal counts (`gbrain extract --stale` only; sync's tail does not read them). */
@@ -35,11 +38,11 @@ export const LINK_FAILURE_REPORT_LIMIT = 50;
  * `STALE_TIME_BUDGET_MS` budget and the next resumes, `catchUp` runs until nothing is stale (#6803 D2).
  */
 export async function runManagedStaleExtraction(engine: BrainEngine,
-  opts: { sourceId?: string; dryRun?: boolean; catchUp?: boolean; timeBudgetMs?: number; counts?: boolean; retryHeld?: boolean }): Promise<ManagedLinkExtraction> {
+  opts: { sourceId?: string; dryRun?: boolean; catchUp?: boolean; timeBudgetMs?: number; counts?: boolean; retryHeld?: boolean; signal?: AbortSignal }): Promise<ManagedLinkExtraction> {
   const counts = async () => opts.counts === false ? {} : { counts: await staleExtractionCounts(engine, opts.sourceId) };
   if (!opts.dryRun) {
     if (opts.retryHeld) await clearLinkExtractionHolds(engine, opts.sourceId);
-    const result = await extractManagedStaleLinks(engine, { sourceId: opts.sourceId, ...(opts.catchUp ? {} : { timeBudgetMs: opts.timeBudgetMs ?? STALE_TIME_BUDGET_MS }) });
+    const result = await extractManagedStaleLinks(engine, { sourceId: opts.sourceId, signal: opts.signal, ...(opts.catchUp ? {} : { timeBudgetMs: opts.timeBudgetMs ?? STALE_TIME_BUDGET_MS }) });
     return { ...result, ...await counts() };
   }
   const remaining = await engine.countStalePagesForExtraction({ sourceId: opts.sourceId, versionTs: await effectiveLinkExtractorWatermark(engine), held: 'exclude' });
@@ -55,7 +58,8 @@ export function formatManagedStaleExtraction(result: ManagedLinkExtraction, dryR
       mention_last_pass_at: result.mention_last_pass_at ?? null } : {
       action: 'extract_stale_done', links_created: result.created, links_removed: result.removed, timeline_created: result.timeline,
       pages_processed: result.pages, stale_remaining: result.remaining + (result.mentions?.remaining ?? 0),
-      ...(result.skipped ? { skipped_changed: result.skipped } : {}), ...(result.mentions ? mentionJsonFields(result.mentions) : {}),
+      ...(changedSkips(result) ? { skipped_changed: changedSkips(result) } : {}), ...(result.attendance_skipped ? { skipped_attendance_incomplete: result.attendance_skipped } : {}),
+      ...(result.mentions ? mentionJsonFields(result.mentions) : {}),
       ...(result.failed ? { failed: result.failed, failures: result.failures } : {}), ...(result.systemic?.length ? { systemic: result.systemic } : {}),
     }), ...(counts ?? {}) });
   }
@@ -66,9 +70,13 @@ export function formatManagedStaleExtraction(result: ManagedLinkExtraction, dryR
   }
   const mentionLine = result.mentions ? formatMentionSummary(result.mentions) : null;
   return `Extract --stale: ${result.created} link(s) created, ${result.removed} removed, ${result.timeline} timeline entr(ies) from ${result.pages} page(s).` +
-    (result.skipped ? ` Skipped ${result.skipped} page(s) edited during extraction or with unresolved attendance; they stay stale.` : '') +
+    (changedSkips(result) ? ` Skipped ${changedSkips(result)} page(s) edited during extraction; they stay stale.` : '') +
+    (result.attendance_skipped ? ` Skipped ${result.attendance_skipped} page(s) with unresolved attendance; they wait for the attendee's person page.` : '') +
     (result.remaining ? ` ${result.remaining} page(s) remain stale (raw total).` : '') + formatLinkFailures(result) + (mentionLine ? `\n${mentionLine}` : '') + countsLine;
 }
+
+/** Pages a run skipped because they changed while it read them (the rest of `skipped` waits on attendance). */
+const changedSkips = (result: ManagedLinkExtraction) => result.skipped - (result.attendance_skipped ?? 0);
 
 /** The failure lines of a run: each listed page with its code and state, then each source the breaker stopped, each with its fix. */
 function formatLinkFailures(result: ManagedLinkExtraction): string {
@@ -100,10 +108,13 @@ export const MANAGED_LINK_EXTRACTION_WIDTH = 4;
  * coordinated transaction, insert-only. This is the one managed extraction
  * path: sync, `extract --stale` (every caller of extractStaleFromDB) and the
  * PGLite owner delegation all run it, in the process that owns the brain.
+ * Each page yields to the event loop when it finishes: PGLite statements
+ * resolve as one microtask chain, so a long drain would otherwise hold every
+ * timer and in-process request until its last page.
  */
 export async function extractManagedStaleLinks(engine: BrainEngine,
   opts: { sourceId?: string; slugs?: readonly string[]; maxPages?: number; timeBudgetMs?: number; signal?: AbortSignal; mentions?: boolean } = {}): Promise<ManagedLinkExtraction> {
-  const result: ManagedLinkExtraction = { pages: 0, created: 0, removed: 0, timeline: 0, skipped: 0, remaining: 0 };
+  const result: ManagedLinkExtraction = { pages: 0, created: 0, removed: 0, timeline: 0, skipped: 0, attendance_skipped: 0, remaining: 0 };
   const startMs = Date.now();
   const withMentions = opts.mentions !== false;
   const deadline = withMentions ? await linkPhaseDeadline(engine, opts.sourceId, startMs, opts.timeBudgetMs)
@@ -130,7 +141,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       if (current?.revision !== snapshot.revision) return null;
       if (!prepared.attendanceComplete) {
         await tx.markPagesAttendanceBlocked([{ slug, source_id: sourceId, revision: current.revision }]);
-        return null;
+        return 'attendance' as const;
       }
       const written = await prepared.apply(tx);
       if (written.errors) return null;
@@ -141,7 +152,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       await tx.markPagesExtractedBatch([{ slug, source_id: sourceId, extractedAt: at }], at);
       return { ...written, timeline: added };
     }, attribution));
-    if (!outcome) { result.skipped++; return; }
+    if (!outcome || outcome === 'attendance') { result.skipped++; if (outcome) result.attendance_skipped!++; return; }
     result.pages++;
     result.created += outcome.created;
     result.removed += outcome.removed;
@@ -157,7 +168,8 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
   // that source and reports it in `systemic`. Nothing of a tripped source is recorded.
   const width = engine.kind === 'postgres' ? MANAGED_LINK_EXTRACTION_WIDTH : 1;
   const runs = new Map<string, ItemRun>();
-  const failed: Array<ItemFailure & { slug: string; source_id: string; revision: string | null }> = [];
+  const failed: Array<ItemFailure & { slug: string; source_id: string; revision: string | null; order: number }> = [];
+  let taken = 0;
   const tripped = new Map<string, OperationError>();
   let stop: { error: unknown } | null = null;
   const each = async (items: ReadonlyArray<{ slug: string; sourceId: string; stamp?: string }>) => {
@@ -165,6 +177,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
     const settled = await Promise.allSettled(Array.from({ length: Math.min(width, items.length) }, async () => {
       while (!stop && next < items.length && budget()) {
         const { slug, sourceId, stamp } = items[next++]!;
+        const order = taken++;
         if (tripped.has(sourceId)) continue;
         try { opts.signal?.throwIfAborted(); } catch (error) { stop ??= { error }; break; }
         started++;
@@ -174,8 +187,9 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
         try {
           await derive(slug, sourceId, stamp, read);
           run.succeed();
+          await yieldToEventLoop();
         } catch (error) {
-          try { failed.push({ ...run.fail(`${sourceId}:${slug}`, error), slug, source_id: sourceId, revision: read.revision }); } catch (stopped) {
+          try { failed.push({ ...run.fail(`${sourceId}:${slug}`, error), slug, source_id: sourceId, revision: read.revision, order }); } catch (stopped) {
             if (stopped !== error && !opts.sourceId) tripped.set(sourceId, stopped as OperationError);
             else stop ??= { error: stopped };
           }
@@ -197,6 +211,8 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
     await each(rows.filter(row => !done.has(`${row.source_id}\0${row.slug}`)).map(row => ({ slug: row.slug, sourceId: row.source_id,
       stamp: row.updated_at.getTime() >= Date.parse(versionTs) ? row.updated_at_iso : versionTs })));
   }
+  // Concurrent Postgres workers fail in completion order; report failures in drain order, as PGLite's single worker does.
+  failed.sort((a, b) => a.order - b.order);
   // Holds are counted only for sources whose failures look like their pages' own (ItemRun.systemic).
   const recorded = await recordLinkExtractionFailures(engine, versionTs,
     failed.filter(f => f.class === 'content' && !tripped.has(f.source_id) && !runs.get(f.source_id)!.systemic()));

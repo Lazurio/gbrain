@@ -13,6 +13,31 @@ import { sha256 } from './digest.ts';
 import { readSyncFile } from './sync-discovery.ts';
 import { VERSION } from '../../version.ts';
 import { pinnedWorktreeConflict } from './sync-page-fault.ts';
+import { LockStolenError } from '../db-lock.ts';
+import { OperationError } from '../ops/contract.ts';
+import { isWriteCapacityWait } from './admission-retry.ts';
+import { isRetryableConnError, isStatementTimeoutError } from '../retry-matcher.ts';
+
+/**
+ * A stop a managed sync run records no failure for, so the next pass resumes it: `lease_lost` when the pass lost its drain
+ * lease (a lapse or a takeover); `transient` for a refresh fence, write back-pressure (#6278), a lost database connection or
+ * a statement timeout (#6340), or a permission refusal. #7614: the pass ends its row `resumable` with this stop reason, so
+ * only a process that died leaves an open row (status and doctor read an open row with no live holder as killed). A pass
+ * that lost its lease writes that row unfenced, guarded by the row's lease token alone: a pass that pinned since keeps its row.
+ * A permission refusal is the exception (`resumableRowStop`): it repeats on every pass until an operator acts, so its row
+ * stays open and reads `pass_interrupted`, then `pass_abandoned`, instead of a resumable pass a plain sync would retry forever.
+ */
+export function unrecordedStop(error: unknown): 'lease_lost' | 'transient' | null {
+  if (error instanceof LockStolenError) return 'lease_lost';
+  const code = error instanceof OperationError ? error.code : null;
+  return (code !== null && ['permission_denied', 'worktree_refreshing', 'refresh_recovery_required'].includes(code)) || isWriteCapacityWait(error)
+    || isRetryableConnError(error) || isStatementTimeoutError(error) ? 'transient' : null;
+}
+
+/** The stop reason a pass row ends `resumable` with: `unrecordedStop` less a permission refusal. */
+export function resumableRowStop(error: unknown): 'lease_lost' | 'transient' | null {
+  return error instanceof OperationError && error.code === 'permission_denied' ? null : unrecordedStop(error);
+}
 
 /**
  * #6712 (#6565): how the run treats a receipt that did not commit, from the terminal classifier: `transport` (a dropped
@@ -32,7 +57,7 @@ export function receiptClass(row: WriteRequest): 'transport' | 'page' | 'systemi
 /**
  * #6712 (#6565): a stop the next plain sync re-freezes in place: a database refusal the fault table retries (an
  * unrecognised P0001 or a 55000 raised under a page write surfaces as `storage_error`). A content, consent or option
- * refusal is never one: its receipt stays the diagnosis until the next sync retries it from HEAD (`retryRecordedFailure`).
+ * refusal is never one: its receipt stays the diagnosis until the next sync takes the path again (a pass re-classifies it at HEAD).
  */
 export function resumableStop(row: WriteRequest): boolean {
   const verdict = classifySyncFault({ code: row.error_code ?? 'storage_error', message: row.error_message ?? null });
@@ -70,7 +95,8 @@ export function replaysContentRefusal(failed: WriteRequest, recorded: { gbrain_v
  * holds the working-tree bytes that refused (the frozen `rawHash`). Bytes decide, never the
  * file's mtime against the stop's database timestamp: those are two clocks, and a correction written within their skew
  * (a filesystem timestamp lags the wall clock by up to a scheduler tick) read as unwritten and replayed the refusal.
- * Committing the file, editing it or upgrading gbrain retries it.
+ * Committing the file, editing it or upgrading gbrain retries it. #6712 PR 4b: the pass replays what its last blocked pass
+ * stopped on (sync-pass-run.ts, under sync.holds=fail).
  */
 export function replaysUnchangedRefusal(failed: WriteRequest, recorded: RecordedStop,
   entry: { root: string; intent: { path?: string | null; rawHash?: string | null }; target: string; head: () => string }): boolean {

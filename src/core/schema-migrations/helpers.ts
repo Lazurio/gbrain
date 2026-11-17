@@ -6,6 +6,9 @@
  * (ESM import cycle -> TDZ at module load, including in the compiled binary).
  */
 import type { BrainEngine } from '../engine.ts';
+import { analyzeDeferred, lockTableForAnalyze } from '../analyze-lock.ts';
+import { migrationStatementTimeoutMs } from '../migration-timeout.ts';
+import { withSchemaLockTimeout } from '../postgres-engine/schema-lock-timeout.ts';
 
 /**
  * When true, per-migration explanatory notices (e.g. the v123/v124 "here is
@@ -67,6 +70,37 @@ export async function dropInvalidConcurrentIndex(
     await engine.runMigration(version, `DROP INDEX CONCURRENTLY IF EXISTS ${indexName};`);
   }
   return isInvalid;
+}
+
+/**
+ * Runs one migration statement outside a transaction: a `transaction: false` migration's SQL (runMigrationSQL), or a
+ * statement its handler runs on its own, such as a VALIDATE CONSTRAINT that must not hold the ALTER's lock. PGLite
+ * runs it as is.
+ *
+ * Postgres can't use SET LOCAL without a transaction or a plain SET on the
+ * pooled connection (it leaks to other queries), so this reserves a dedicated
+ * backend and sets session-level statement_timeout on just that connection.
+ * On Supabase (both PgBouncer 6543 and direct 5432) a server-level
+ * statement_timeout of ~2 min is enforced; without this override a CREATE
+ * INDEX CONCURRENTLY or a VALIDATE on a large table hits it and aborts.
+ * #5227 (W14 P1.6): the lock wait is bounded session-level on the same backend
+ * and restored after. #6543 (A4): the raised statement_timeout is restored too,
+ * so the connection does not carry the migration's budget back to the pool.
+ */
+export async function runMigrationStatement(engine: BrainEngine, version: number, sql: string): Promise<void> {
+  if (engine.kind !== 'postgres') { await engine.runMigration(version, sql); return; }
+  await engine.withReservedConnection(async (conn) => {
+    try {
+      await conn.executeRaw(`SET statement_timeout = '${migrationStatementTimeoutMs()}'`);
+    } catch {
+      // Non-fatal: some managed Postgres may restrict this GUC; the statement then runs with the server default.
+    }
+    try {
+      await withSchemaLockTimeout({ unsafe: (query: string) => conn.executeRaw(query) }, () => conn.executeRaw(sql), { step: `migration v${version}` });
+    } finally {
+      await conn.executeRaw('RESET statement_timeout').catch(() => {});
+    }
+  }, { selfContained: true });
 }
 
 export type OnlineIndexOutcome = 'present' | 'created' | 'rebuilt' | 'building';
@@ -131,28 +165,43 @@ async function tableRows(engine: BrainEngine, table: string): Promise<number> {
 const PLANNER_REPAIR_TABLES = new Set(['pages', 'links', 'facts', 'takes', 'content_chunks', 'timeline_entries']);
 
 /**
+ * #7083: one migration ANALYZE in its own transaction that never waits on the table's lock (`lockTableForAnalyze`):
+ * a vacuum, ANALYZE or index build holding the table defers it (returns false) instead of cancelling an autovacuum,
+ * which on a large table restarts its whole heap scan. `statementTimeoutMs` bounds it on Postgres; other errors throw.
+ */
+export async function analyzeYieldingToVacuum(engine: BrainEngine, table: string, columns = '', statementTimeoutMs?: number): Promise<boolean> {
+  try {
+    await engine.transaction(async tx => {
+      if (engine.kind === 'postgres' && statementTimeoutMs) await tx.executeRaw(`SET LOCAL statement_timeout = '${statementTimeoutMs}ms'`);
+      await lockTableForAnalyze(tx, table);
+      await tx.executeRaw(`ANALYZE ${table}${columns ? `(${columns})` : ''}`);
+    });
+    return true;
+  } catch (error) {
+    if (analyzeDeferred(error)) return false;
+    throw error;
+  }
+}
+
+/**
  * lhf wave 2 item 6: a new index on an expression has no planner statistics until
  * its table is analyzed, and PGLite runs no autovacuum (a 50-name `entity names`
  * batch after v240 on a 55k-page PGLite brain: 5.4 s, 1.2 s after ANALYZE pages).
  * Best effort: one whole-table ANALYZE (a column list collects no index
- * statistics), Postgres bounded by a 60 s statement and 2 s lock timeout. A
- * failure prints the command that finishes the job and never fails the build of
- * a valid index; doctor `planner_stats_stale` keeps reporting the index.
+ * statistics), Postgres bounded by a 60 s statement and deferred, never waiting,
+ * while another session holds the table (#7083). A failure or deferral prints the
+ * command that finishes the job and never fails the build of a valid index;
+ * doctor `planner_stats_stale` keeps reporting the index.
  */
 export async function analyzeAfterIndexBuild(engine: BrainEngine, index: { name: string; table: string }): Promise<boolean> {
+  const fix = PLANNER_REPAIR_TABLES.has(index.table) ? 'gbrain repair planner-stats --apply' : `ANALYZE ${index.table} as the table owner`;
+  let why: string;
   try {
-    await engine.transaction(async tx => {
-      if (engine.kind === 'postgres') {
-        await tx.executeRaw("SET LOCAL statement_timeout = '60s'");
-        await tx.executeRaw("SET LOCAL lock_timeout = '2s'");
-      }
-      await tx.executeRaw(`ANALYZE ${index.table}`);
-    });
-    return true;
+    if (await analyzeYieldingToVacuum(engine, index.table, '', 60_000)) return true;
+    why = 'another session (a vacuum, an ANALYZE or an index build) holds the table, and a migration never waits on it';
   } catch (err) {
-    const fix = PLANNER_REPAIR_TABLES.has(index.table) ? 'gbrain repair planner-stats --apply' : `ANALYZE ${index.table} as the table owner`;
-    console.warn(`  [warn] ${index.name} is built and valid, but ANALYZE ${index.table} failed `
-      + `(${err instanceof Error ? err.message : String(err)}); the planner has no statistics for it yet. Run on the brain host: ${fix}`);
-    return false;
+    why = err instanceof Error ? err.message : String(err);
   }
+  console.warn(`  [warn] ${index.name} is built and valid, but ANALYZE ${index.table} failed (${why}); the planner has no statistics for it yet. Run on the brain host: ${fix}`);
+  return false;
 }
