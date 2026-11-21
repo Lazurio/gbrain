@@ -210,6 +210,7 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
   }
   if (operation === 'writer_reindex_code') return (await import('./reindex-administration.ts')).runAuthenticatedCodeReindex(engine, params);
   if (operation === 'writer_embed_facts') return (await import('./embed-facts-administration.ts')).runAuthenticatedFactEmbedding(engine, params, config);
+  if (operation === 'writer_embed_stale') return (await import('./embed-stale-administration.ts')).runAuthenticatedStaleEmbedding(engine, params);
   if (operation === 'writer_git_durability') {
     const { GIT_DURABILITY_PARAMS, runGitDurabilityAdministration } = await import('./git-durability-administration.ts');
     keys(params, [...GIT_DURABILITY_PARAMS]);

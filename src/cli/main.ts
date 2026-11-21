@@ -2390,6 +2390,10 @@ async function prepareConnectedDispatch(command: string, args: string[]): Promis
   if (command === 'embed' && args.includes('--facts')) {
     if (await (await import('../commands/embed-facts-delegate.ts')).maybeDelegateFactEmbed(loadConfig(), args)) return null;
   }
+  // A stale drain while a resident serve holds the PGLite brain: the owner runs it (commands/embed-stale-delegate.ts).
+  if (command === 'embed' && args.includes('--stale') && !args.includes('--facts')) {
+    if (await (await import('../commands/embed-stale-delegate.ts')).maybeDelegateStaleEmbed(loadConfig(), args)) return null;
+  }
 
   // Serve-delegated sweep preflight (#677) — same shape as sync above: a live
   // `gbrain serve` owns the PGLite single-writer lock, so `sweep --once` used

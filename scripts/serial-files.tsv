@@ -168,6 +168,8 @@ test/embed-quarantine.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts
 test/embed-stale-chunkless-pages.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/embed-stale-dry-run-restamp-5289.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/embed-stale-progress-5968.serial.test.ts	R1	R1: mutates process.env (GBRAIN_MAX_CHUNK_TOKENS)
+test/embed-stale-heal-budget.serial.test.ts	global-state	global-state: configureGateway and __setEmbedTransportForTests change the process-wide AI gateway; withEnv scopes GBRAIN_EMBED_TIME_BUDGET_MS, the process budget the heal must not read
+test/embed-stale-resident.serial.test.ts	global-state	global-state: runs a live PGLite persistence owner on a socket in its temp home and spawns real gbrain CLI children that delegate to it; configureGateway and __setEmbedTransportForTests change the process-wide AI gateway; withEnv scopes GBRAIN_HOME, GBRAIN_EMBED_TIME_BUDGET_MS and GBRAIN_EMBEDDING_MULTIMODAL
 test/embed-stale-signature-pagination.serial.test.ts	R1	R1: mutates process.env (GBRAIN_EMBED_CONCURRENCY)
 test/embed-stale-unavailable-snapshot.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/embed.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process

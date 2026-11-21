@@ -15,7 +15,7 @@
  */
 import type { BrainEngine } from './engine.ts';
 import type { Action } from './agent-output.ts';
-import { requireConsent, type Authorization } from './consent.ts';
+import { requireConsent, type Authorization, type ConsentEnv } from './consent.ts';
 import { opError } from './ops/contract.ts';
 
 /** Job names whose handler is an embedding backfill (an explicit `jobs submit` of one is paid work). */
@@ -122,6 +122,8 @@ export async function requireEmbedBackfillConsent(engine: BrainEngine, opts: {
   preview_argv?: string[];
   args: readonly string[];
   scope: EmbedBackfillScope;
+  /** A resident owner runs it for a CLI: no prompt in the owner's terminal, its notes travel back (embed-stale-administration.ts). */
+  env?: Pick<ConsentEnv, 'interactive' | 'note'>;
 }): Promise<Authorization | null> {
   if (!(await embedWouldSpend(engine, { images: opts.scope.images === true }))) return null;
   const est = await estimateEmbedBackfillUsd(engine, opts.scope);
@@ -138,7 +140,7 @@ export async function requireEmbedBackfillConsent(engine: BrainEngine, opts: {
     ...(opts.preview_argv ? { preview_argv: opts.preview_argv } : {}),
     est_usd: est,
     args: opts.args,
-  }, { getConfig: (key) => engine.getConfig(key) });
+  }, { getConfig: (key) => engine.getConfig(key), ...opts.env });
   if (auth.cap_usd !== null && est !== null && est > auth.cap_usd) {
     throw opError('cost_cap_exceeded',
       `The embedding backfill is estimated at $${est.toFixed(4)}, above the $${auth.cap_usd.toFixed(2)} cap; nothing ran.`,
