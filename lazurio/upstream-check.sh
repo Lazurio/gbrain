@@ -40,7 +40,9 @@ while IFS=$'\t' read -r subject paths; do
   for path in $changed; do
     case " $paths " in *" $path "*) ;; *) fail "'$subject' changes $path, which its line does not list" ;; esac
   done
-  git -C "$work/tree" cherry-pick -x "$commit" > "$work/pick.log" 2>&1 \
+  # A committer for the throwaway picks: a CI runner or a fresh home has no git identity.
+  git -C "$work/tree" -c user.name='Lazurio upstream check' -c user.email='upstream-check@lazurio.invalid' \
+    cherry-pick -x "$commit" > "$work/pick.log" 2>&1 \
     || { cat "$work/pick.log"; fail "'$subject' does not apply cleanly onto $NEWER"; }
   echo "ok: $subject"
   for path in $paths; do case "$path" in test/*) tests+=("$path") ;; esac; done
