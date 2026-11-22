@@ -29,7 +29,7 @@ extra=$(git diff --name-only "$TAG" "$COMMIT" | grep -Ev "$pattern" \
   | grep -vxF -e package.json ${patched:+$(printf -- '-e %s ' $patched)} || true)
 [ -z "$extra" ] || fail "$COMMIT differs from $TAG outside the overlay and the listed patches:
 $extra"
-version_only=$(git diff -U0 "$TAG" "$COMMIT" -- package.json | grep -E '^[+-] ' | grep -vE '^[+-]  "version": "[^"]+",$' || true)
+version_only=$(git diff -U0 "$TAG" "$COMMIT" -- package.json | bash "$(dirname "$0")/package-diff.sh")
 [ -z "$version_only" ] || fail "package.json differs from $TAG beyond its version:
 $version_only"
 echo "ok: $(git rev-parse --short "$COMMIT") = upstream $TAG ($(git rev-parse --short "$TAG^{commit}"), stable) + overlay [${OVERLAY[*]}] + $(printf '%s\n' $patched | grep -c . || true) patched paths (lazurio/patches.list)"

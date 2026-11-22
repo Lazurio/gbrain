@@ -29,6 +29,8 @@ jobs:
           echo "current=$current" >> "$GITHUB_OUTPUT"
           echo "newest=$newest" >> "$GITHUB_OUTPUT"
           echo "current $current, newest stable $newest"
+      - name: The fork check's package.json rule
+        run: bash lazurio/package-diff.test.sh
       - name: Fork check
         run: bash lazurio/fork-check.sh "${{ steps.tags.outputs.current }}"
       - name: The patches carry onto the newest upstream stable release

@@ -13,6 +13,7 @@ a s návrhem pro upstream, aby fork nikdy nebránil převzetí novějšího upst
 | --- | --- |
 | `lazurio/README.md` | Tento postup. |
 | `lazurio/fork-check.sh` | Ověří, že commit je přesný upstream tag a k němu jen overlay, opravy ze seznamu a verze vydání. |
+| `lazurio/package-diff.sh`, `lazurio/package-diff.test.sh` | Pravidlo kontroly forku pro `package.json` (smí se lišit jen řádek s verzí) a jeho test. |
 | `lazurio/patches.list` | Seznam oprav kódu: předmět commitu a soubory, které smí měnit. |
 | `lazurio/upstream-check.sh` | Přenese opravy na novější upstream tag a skončí chybou, když se nepřenesou čistě. |
 | `lazurio/upgrade-test/` | Zkouška přechodu mozku ze starého vydání na nové, na smyšlených datech. |
@@ -21,7 +22,7 @@ a s návrhem pro upstream, aby fork nikdy nebránil převzetí novějšího upst
 
 | Oprava (předmět commitu) | Proč | Upstream |
 | --- | --- | --- |
-| `embed --stale: hand the drain to a resident PGLite owner (writer_embed_stale)` | Lazurio dopočítává hledání podle významu, zatímco server běží. Bez opravy `embed --stale` při běžícím serveru skončí `pglite_busy`, a paměť se musí zastavit. | návrh PR připravený, odeslání čeká na slovo |
+| `embed --stale: hand the drain to a resident PGLite owner (writer_embed_stale)` | Lazurio dopočítává hledání podle významu, zatímco server běží. Bez opravy `embed --stale` při běžícím serveru skončí `pglite_busy`, a paměť se musí zastavit. Server spouští běh stejně jako CLI: se souhlasem a stropem útraty, s průchodem obrázků a s rozpočtem času z CLI. | návrh PR připravený, odeslání čeká na slovo |
 | `embeddings enable: record the model and width in the database plane too` | Mozek založený bez embeddingů a zapnutý později odmítal počítat vektory faktů (v databázi zůstal výchozí model). | návrh issue připravený, odeslání čeká na slovo |
 
 Opravu zapisuj sem i do `lazurio/patches.list`, i s důvodem a s odkazem na

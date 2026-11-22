@@ -5,5 +5,5 @@
 # its own tests. lazurio/fork-check.sh allows a difference from upstream only
 # in lazurio/, in these paths and in package.json's version;
 # lazurio/upstream-check.sh carries these patches onto a newer upstream tag.
-embed --stale: hand the drain to a resident PGLite owner (writer_embed_stale)	src/commands/embed.ts src/cli/main.ts src/core/persistence/admin-contract.ts src/core/persistence/administration.ts src/commands/embed-stale-delegate.ts src/core/persistence/embed-stale-administration.ts test/embed-stale-delegate.test.ts
+embed --stale: hand the drain to a resident PGLite owner (writer_embed_stale)	src/commands/embed.ts src/cli/main.ts src/core/persistence/admin-contract.ts src/core/persistence/administration.ts src/commands/embed-stale-delegate.ts src/core/persistence/embed-stale-administration.ts src/core/embed-consent.ts test/embed-stale-delegate.test.ts test/embed-stale-resident.serial.test.ts test/writer-failures-cli-6650.test.ts
 embeddings enable: record the model and width in the database plane too	src/commands/embeddings.ts test/embeddings-enable-db-plane.test.ts
