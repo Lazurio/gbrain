@@ -90,10 +90,45 @@ function brainArgs(brainId: string): string[] {
   return brainId === 'host' ? [] : ['--brain', brainId];
 }
 
+/**
+ * The column of each primary embedding store that names the model a row's
+ * vector was written with (the gateway-resolved `provider:model`, the same
+ * model truth the embedding migration relies on). query_cache has none: it is
+ * a cache (see the stamped-vectors case below).
+ */
+const VECTOR_MODEL_STAMP: Partial<Record<string, string>> = { content_chunks: 'model', facts: 'embedding_model', takes: 'embedding_model' };
+
+/**
+ * Whether every stored vector names `model` as its own: then the vectors are
+ * that model's even though the database plane does not record it yet (a brain
+ * enabled before `embeddings enable` recorded the plane kept the new-install
+ * default there). A vector with no stamp, another model's stamp, or in a store
+ * without stamps other than the cache, is not.
+ */
+async function vectorsAllStamped(engine: BrainEngine, model: string, tables: readonly string[]): Promise<boolean> {
+  for (const table of tables) {
+    if (table === 'query_cache') continue;
+    const stamp = VECTOR_MODEL_STAMP[table];
+    if (!stamp) return false;
+    const [row] = await engine.executeRaw<{ other: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM ${table} WHERE embedding IS NOT NULL AND ${stamp} IS DISTINCT FROM $1) AS other`, [model]);
+    if (row?.other !== false) return false;
+  }
+  return true;
+}
+
 async function assertSameIdentity(engine: BrainEngine, model: string): Promise<void> {
   const stored = await readStoredEmbeddingIdentity(engine);
   if (stored?.model === model) return;
-  for (const table of await readPrimaryEmbeddingStores(engine)) {
+  const tables = await readPrimaryEmbeddingStores(engine);
+  // Every vector stamped with this model: the same identity, only unrecorded. The query cache's vectors carry no
+  // stamp, so they are dropped (the cache refills on the next query, as after an embedding migration) and no vector
+  // of unknown origin stays under the identity the caller records next.
+  if (await vectorsAllStamped(engine, model, tables)) {
+    if (tables.includes('query_cache')) await engine.executeRaw('DELETE FROM query_cache WHERE embedding IS NOT NULL');
+    return;
+  }
+  for (const table of tables) {
     const [row] = await engine.executeRaw<{ present: boolean }>(`SELECT EXISTS (SELECT 1 FROM ${table} WHERE embedding IS NOT NULL) AS present`);
     if (row?.present) {
       throw opError('embedding_model_mismatch', 'This brain already holds vectors from a different or unrecorded embedding model; enabling cannot change their identity.',
