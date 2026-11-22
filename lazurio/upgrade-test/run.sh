@@ -27,6 +27,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 BASE=http://127.0.0.1:$PORT
 RUN=$WORK/run; H=$RUN/home; VAULT=$RUN/vault; REMOTE=$RUN/vault-remote.git; TOK=$RUN/tokens
 export GBRAIN_HOME=$H GIT_TERMINAL_PROMPT=0 GBRAIN_GIT_ALLOW_FILE_TRANSPORT=1
+# No idle upkeep in the servers this test starts: from 0.60.733 it may run the
+# conversation archive, which reads the harness sessions of this machine's real
+# home into the test brain. The test needs none of it.
+export GBRAIN_SWEEP=0
 say() { printf '\n== %s\n' "$*"; }
 fail() { echo "FAIL: $*"; exit 1; }
 
