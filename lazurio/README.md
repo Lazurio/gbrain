@@ -24,6 +24,7 @@ a s návrhem pro upstream, aby fork nikdy nebránil převzetí novějšího upst
 | --- | --- | --- |
 | `embed --stale: hand the drain to a resident PGLite owner (writer_embed_stale)` | Lazurio dopočítává hledání podle významu, zatímco server běží. Bez opravy `embed --stale` při běžícím serveru skončí `pglite_busy`, a paměť se musí zastavit. Server spouští běh stejně jako CLI: se souhlasem a stropem útraty, s průchodem obrázků a s rozpočtem času z CLI. | návrh PR připravený, odeslání čeká na slovo |
 | `embeddings enable: record the model and width in the database plane too` | Mozek založený bez embeddingů a zapnutý později odmítal počítat vektory faktů (v databázi zůstal výchozí model). | návrh issue připravený, odeslání čeká na slovo |
+| `embeddings enable: a brain whose vectors are all stamped with the model passes the identity check` | Mozek zapnutý dřívějším vydáním už má vektory stránek, ale v databázi výchozí model, takže opakované `enable` se stejným modelem končilo `embedding_model_mismatch` a fakta se nikdy nedopočítala. Rozhoduje teď označení modelu u každého vektoru; jiný nebo smíšený model se dál odmítne. | patří k návrhu issue výše |
 
 Opravu zapisuj sem i do `lazurio/patches.list`, i s důvodem a s odkazem na
 upstream issue nebo PR. Když upstream stejnou věc opraví, oprava z overlaye
