@@ -31,6 +31,7 @@ import { renderCliError, type Action } from '../core/agent-output.ts';
 import { recordAgentContractEvent } from '../core/agent-contract-log.ts';
 import { setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { runVectorPrewarm, vectorPrewarmUnsupported } from '../core/vector-prewarm.ts';
+import { recordInitEmbedding } from './init-embedding-plane.ts';
 
 const USAGE = `Usage: gbrain embeddings enable --embedding-model <provider:model> [--embedding-dimensions <N>] [--brain <id>] [--json]
        gbrain embeddings prewarm [--dry-run] [--brain <id>] [--json]
@@ -144,7 +145,10 @@ async function enable(opts: EnableOpts): Promise<Record<string, unknown>> {
     fileCfg.embedding_dimensions = width;
     delete fileCfg.embedding_disabled;
     saveConfig(fileCfg);
-    await engine.unsetConfig('embedding_disabled');
+    // The database plane gets the model and width too, as init records them (#9451): fact embedding compares the
+    // database's identity with the configured model, so a brain made keyless and enabled later kept the new-install
+    // default there and refused every fact embedding. assertSameIdentity above refused vectors of another model.
+    await recordInitEmbedding(engine, opts.model, width);
     const queuedChunks = await engine.countStaleChunks();
     const queuedFacts = (await countStaleFactEmbeddings(engine, opts.model, width)).count;
     return {

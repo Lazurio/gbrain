@@ -1,0 +1,9 @@
+# The fork's code patches over upstream: one line each, tab-separated.
+#   <commit subject>	<the paths it may change, space-separated>
+# A patch is found by its exact subject in <upstream tag>..<commit>, so its
+# hash may change when it is carried to a newer upstream. Each patch carries
+# its own tests. lazurio/fork-check.sh allows a difference from upstream only
+# in lazurio/, in these paths and in package.json's version;
+# lazurio/upstream-check.sh carries these patches onto a newer upstream tag.
+embed --stale: hand the drain to a resident PGLite owner (writer_embed_stale)	src/commands/embed.ts src/cli/main.ts src/core/persistence/admin-contract.ts src/core/persistence/administration.ts src/commands/embed-stale-delegate.ts src/core/persistence/embed-stale-administration.ts src/core/embed-consent.ts test/embed-stale-delegate.test.ts test/embed-stale-resident.serial.test.ts test/embed-stale-heal-budget.serial.test.ts test/writer-failures-cli-6650.test.ts scripts/serial-files.tsv
+embeddings enable: record the model and width in the database plane too	src/commands/embeddings.ts test/embeddings-enable-db-plane.test.ts

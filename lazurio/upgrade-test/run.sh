@@ -27,6 +27,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 BASE=http://127.0.0.1:$PORT
 RUN=$WORK/run; H=$RUN/home; VAULT=$RUN/vault; REMOTE=$RUN/vault-remote.git; TOK=$RUN/tokens
 export GBRAIN_HOME=$H GIT_TERMINAL_PROMPT=0 GBRAIN_GIT_ALLOW_FILE_TRANSPORT=1
+# No idle upkeep in the servers this test starts: from 0.60.733 it may run the
+# conversation archive, which reads the harness sessions of this machine's real
+# home into the test brain. The test needs none of it.
+export GBRAIN_SWEEP=0
 say() { printf '\n== %s\n' "$*"; }
 fail() { echo "FAIL: $*"; exit 1; }
 
@@ -59,6 +63,9 @@ snapshot() { py snapshot.py "$HERE" "$BASE" "$TOK/hermes-buddy" "$TOK/lazurio-la
 tools() { py mcp.py tools "$BASE" "$TOK/hermes-buddy" > "$WORK/tools-$1-rw.json"; py mcp.py tools "$BASE" "$TOK/lazurio-launchpad-brain" > "$WORK/tools-$1-ro.json"; }
 
 [ -e "$RUN" ] && fail "$RUN exists; use an empty work dir"
+# A server this run started never outlives it, also where a check fails: it is
+# started in its own session (setsid) and would keep the port for the next run.
+trap '[ -s "$RUN/serve.pid" ] && kill -TERM "$(cat "$RUN/serve.pid")" 2> /dev/null || true' EXIT
 mkdir -p "$WORK"; say "install"; install "$FROM" "$WORK/from"; install "$TO" "$WORK/to"
 echo "from $(gb "$WORK/from" --version)  to $(gb "$WORK/to" --version)"
 
@@ -77,6 +84,11 @@ git -C "$VAULT" checkout -q -B main origin/main; git -C "$VAULT" branch -q --set
 git -C "$VAULT" config user.name gbrain-test; git -C "$VAULT" config user.email test@example.invalid
 gb "$WORK/from" config set sync.on_commit true > /dev/null
 serve "$WORK/from" start
+# As Lazurio does it (src/brain/vault.ts, switchDurability): refresh the source
+# first, then read its admin state and enable durability against that state.
+# From 0.60.733 the refresh may change the writer topology, so a state read
+# before it is stale (writer_admin_state_changed).
+gb "$WORK/from" sources refresh default --json > "$RUN/refresh.json" 2>&1 || fail "source refresh failed (see $RUN/refresh.json)"
 STATE=$(gb "$WORK/from" sources writer status default --json 2> /dev/null | json_field 'd["admin_state"]')
 gb "$WORK/from" sources writer git-durability default --enable --admin-intent writer_git_durability \
   --expected-state "$STATE" --json > "$RUN/durability.json" 2>&1 || fail "git durability not enabled (see $RUN/durability.json)"

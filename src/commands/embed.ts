@@ -199,6 +199,12 @@ export interface EmbedOpts {
    */
   catchUp?: boolean;
   /**
+   * The stale run's wall-clock budget for this call, instead of the process's
+   * `GBRAIN_EMBED_TIME_BUDGET_MS`: a run the persistence owner makes for a
+   * CLI (`writer_embed_stale`) carries the CLI's budget, not the server's.
+   */
+  timeBudgetMs?: number;
+  /**
    * #1737: cooperative-abort signal from the Minions worker (wall-clock
    * timeout, lock loss, SIGTERM). When it fires, the embed loops break
    * cleanly with partial progress preserved so the autopilot cycle's
@@ -741,6 +747,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
           batchSize: opts.batchSize,
           priority: opts.priority,
           catchUp: opts.catchUp,
+          timeBudgetMs: opts.timeBudgetMs,
           pacer,
           paceMaxConcurrency,
           quiet: opts.quiet,
@@ -885,6 +892,26 @@ export function isKeylessStaleRefusal(args: string[], embeddingDisabled: boolean
     && embeddingDisabled === true;
 }
 
+/**
+ * The keyless clean refusal itself (see isKeylessStaleRefusal): the stderr
+ * line and the zero result, or null when it does not apply. Read from the
+ * file plane, so the CLI answers it before handing a stale drain to a
+ * resident owner too (embed-stale-delegate.ts).
+ */
+export async function keylessStaleRefusal(args: string[]): Promise<EmbedResult | null> {
+  const keylessConfig = loadConfig();
+  if (!isKeylessStaleRefusal(args, keylessConfig?.embedding_disabled)) return null;
+  const enable = (await import('../core/readiness.ts')).embeddingEnablement(keylessConfig!).argv ?? ['gbrain', 'init', '--force', '--embedding-model', '<provider:model>'];
+  process.stderr.write('[embed] Embeddings are disabled on this brain (keyless install), so there are no vectors to compute. Keyword search covers every chunked page; '
+    + 'pages an older version skipped for size become keyword-searchable with gbrain reindex --oversized (free). '
+    + `Turn on semantic search (pages and facts are kept): ${(await import('../core/agent-output.ts')).shellQuote(enable)}\n`);
+  return {
+    embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0,
+    pages_processed: 0, failures: 0, failure_samples: [], dryRun: false,
+    chunkless_pages_healed: 0,
+  };
+}
+
 /** The `--slugs` list: the arguments after it up to the next flag, so `--slugs a b --max-usd 1` never reads `1` as a slug. */
 function slugsAfter(args: readonly string[], at: number): string[] {
   const end = args.findIndex((a, i) => i > at && a.startsWith('--'));
@@ -904,18 +931,8 @@ export async function runEmbed(engine: BrainEngine, args: string[], selectedConf
   // background block so we never queue a job that can only fail. stderr only;
   // stdout stays empty like every other embed outcome (embed has no JSON
   // result surface — do not invent one here).
-  const keylessConfig = loadConfig();
-  if (isKeylessStaleRefusal(args, keylessConfig?.embedding_disabled)) {
-    const enable = (await import('../core/readiness.ts')).embeddingEnablement(keylessConfig!).argv ?? ['gbrain', 'init', '--force', '--embedding-model', '<provider:model>'];
-    process.stderr.write('[embed] Embeddings are disabled on this brain (keyless install), so there are no vectors to compute. Keyword search covers every chunked page; '
-      + 'pages an older version skipped for size become keyword-searchable with gbrain reindex --oversized (free). '
-      + `Turn on semantic search (pages and facts are kept): ${(await import('../core/agent-output.ts')).shellQuote(enable)}\n`);
-    return {
-      embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0,
-      pages_processed: 0, failures: 0, failure_samples: [], dryRun: false,
-      chunkless_pages_healed: 0,
-    };
-  }
+  const keyless = await keylessStaleRefusal(args);
+  if (keyless) return keyless;
 
   if (args.includes('--held')) {
     const held = await heldEmbedArgv(engine, args, currentEmbeddingSignature(), args.includes('--json') ? serr : slog);
@@ -1296,6 +1313,7 @@ async function embedAll(
   onProgress?: (done: number, total: number, embedded: number) => void,
   sourceId?: string,
   staleOpts?: {
+    timeBudgetMs?: number;
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
@@ -1551,9 +1569,11 @@ async function embedAll(
  * (the SQL predicate is idempotent; nothing here requires finishing in one
  * pass). `startedAt` is shared with the caller's overall run clock (review
  * catch) — healing and the main stale loop draw from ONE combined budget
- * window, not two independent 30-minute ones. `catchUp` mirrors the main
- * loop's own `--catch-up` handling: removes the cap entirely (the keyset
- * cursor still terminates on its own; `signal` remains the abort path).
+ * window, not two independent 30-minute ones. `budgetMs` is the main
+ * loop's own resolved budget (its `timeBudgetMs` or the env setting), so a
+ * run a resident owner makes for a CLI heals within the CLI's window too;
+ * null is `--catch-up`: no cap (the keyset cursor still terminates on its
+ * own; `signal` remains the abort path).
  */
 async function healChunklessPages(
   engine: BrainEngine,
@@ -1564,13 +1584,11 @@ async function healChunklessPages(
   signal: AbortSignal | undefined,
   pacer: DbPacer | undefined,
   startedAt: number,
-  catchUp: boolean,
+  budgetMs: number | null,
   assertOwned?: (tx?: BrainEngine) => Promise<void>,
 ): Promise<void> {
   const BATCH_SIZE = 50;
-  const BUDGET_MS: number | null = catchUp
-    ? null
-    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+  const BUDGET_MS = budgetMs;
   const activePacer = pacer ?? createNoopPacer();
   let afterPageId: number | undefined;
   let pagesHealed = 0;
@@ -1679,6 +1697,7 @@ async function embedAllStale(
   result: EmbedResult,
   onProgress?: (done: number, total: number, embedded: number) => void,
   staleOpts?: {
+    timeBudgetMs?: number;
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
@@ -1703,7 +1722,7 @@ async function embedAllStale(
   const overallStartedAt = Date.now();
   const BUDGET_MS: number | null = staleOpts?.catchUp
     ? null
-    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+    : staleOpts?.timeBudgetMs ?? parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
 
   // D7: thread sourceId so source-scoped runs only count + visit
   // that source's NULL embeddings.
@@ -1749,7 +1768,7 @@ async function embedAllStale(
   if (chunklessCount > 0) {
     await healChunklessPages(
       engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal, staleOpts?.pacer,
-      overallStartedAt, !!staleOpts?.catchUp, staleOpts?.assertOwned,
+      overallStartedAt, BUDGET_MS, staleOpts?.assertOwned,
     );
   }
   // Review catch: an abort during healing must stop the run HERE, before

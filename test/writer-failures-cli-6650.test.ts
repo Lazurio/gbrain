@@ -135,7 +135,8 @@ describe('capability handshake across releases', () => {
     bindings.push(binding!);
     const capability = await requestPersistenceCapabilities(path);
     expect((capability.administration ?? []).every(op => FROZEN.includes(op))).toBe(true);
-    expect(capability.administration_extensions).toEqual(['writer_failures', 'writer_transfer_cancel', 'writer_settle_effects']);
+    expect(capability.administration_extensions).toEqual(['writer_failures', 'writer_transfer_cancel', 'writer_settle_effects', 'writer_embed_stale']);
+    expect(ownerAdministers(capability, 'writer_embed_stale')).toBe(true);
     expect(ownerAdministers(capability, 'writer_failures')).toBe(true);
     expect(ownerAdministers(capability, 'writer_transfer_cancel')).toBe(true);
     expect(ownerAdministers(capability, 'writer_settle_effects')).toBe(true);
