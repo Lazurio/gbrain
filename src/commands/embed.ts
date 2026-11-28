@@ -6,6 +6,7 @@ import { embedStaleFacts, refusedFactsLine, type EmbedFactsResult } from '../cor
 import { embedTakesForStaleDrain, type EmbedTakesResult } from '../core/embed-takes.ts';
 import { parseFactEmbedArgs } from './embed-facts-delegate.ts';
 import { readProjectionSnapshot, installPageProjection, installPageEmbeddings, PageProjectionConflictError, retryProjectionConflict } from '../core/page-state/projections.ts';
+import { pageVectorsInPlainTier } from '../core/page-state/projections.ts';
 import { projectionConflictLine } from '../core/agent-output.ts';
 import { withChunkStatisticsRefresh } from '../core/search/projection-statistics.ts';
 import { PageRevisionConflictError } from '../core/page-state/types.ts';
@@ -54,6 +55,7 @@ export { resolveEmbedConcurrency, _resetEmbedConcurrencyClampWarningForTest } fr
 import { isEmbeddingZeroNormError } from '../core/ai/embedding-guard.ts';
 import { wrapChunkTextsForStoredMode } from '../core/embedding-context.ts';
 import { meterPageBatch, spendGrant } from '../core/page-embedding-budget.ts';
+import { staleInstallEvery, staleInstallSlices } from '../core/embed-install-every.ts';
 import { heldApprovalUsd, heldEmbedArgv } from '../core/held-embedding.ts';
 import { countSegmentedEmbedRows, embedSegmentedPage, readSealedSegmentedEmbedPage, readSegmentedEmbedPage, type SegmentedEmbedPage } from '../core/page-body/segmented-embedding.ts';
 import {
@@ -204,6 +206,16 @@ export interface EmbedOpts {
    * CLI (`writer_embed_stale`) carries the CLI's budget, not the server's.
    */
   timeBudgetMs?: number;
+  /**
+   * Lazurio: the stale run installs an unmetered page's vectors every this
+   * many chunks instead of once per page, so a budget that stops the drain
+   * mid-page keeps what it computed. `null`: one install per page (upstream's
+   * behaviour), whatever this process's environment says. Unset:
+   * `GBRAIN_EMBED_STALE_INSTALL_EVERY`, else one install per page. A run the
+   * persistence owner makes for a CLI carries the CLI's setting, `null` where
+   * the CLI has none, like `timeBudgetMs`.
+   */
+  installEvery?: number | null;
   /**
    * #1737: cooperative-abort signal from the Minions worker (wall-clock
    * timeout, lock loss, SIGTERM). When it fires, the embed loops break
@@ -748,6 +760,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
           priority: opts.priority,
           catchUp: opts.catchUp,
           timeBudgetMs: opts.timeBudgetMs,
+          installEvery: opts.installEvery,
           pacer,
           paceMaxConcurrency,
           quiet: opts.quiet,
@@ -1314,6 +1327,7 @@ async function embedAll(
   sourceId?: string,
   staleOpts?: {
     timeBudgetMs?: number;
+    installEvery?: number | null;
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
@@ -1698,6 +1712,8 @@ async function embedAllStale(
   onProgress?: (done: number, total: number, embedded: number) => void,
   staleOpts?: {
     timeBudgetMs?: number;
+    /** Lazurio: install an unmetered page's vectors every N chunks (EmbedOpts.installEvery). */
+    installEvery?: number | null;
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
@@ -1723,6 +1739,9 @@ async function embedAllStale(
   const BUDGET_MS: number | null = staleOpts?.catchUp
     ? null
     : staleOpts?.timeBudgetMs ?? parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+  // null: one install per page, as a CLI without the setting asked; only an
+  // unset option reads this process's own setting.
+  const INSTALL_EVERY = staleOpts?.installEvery !== undefined ? staleOpts.installEvery : staleInstallEvery();
 
   // D7: thread sourceId so source-scoped runs only count + visit
   // that source's NULL embeddings.
@@ -2093,6 +2112,8 @@ async function embedAllStale(
 
       async function embedOneKey(key: string) {
         let stale = byKey.get(key)!;
+        // The chunks a failure still owns once slices of the page installed.
+        let unsettled: typeof stale | null = null;
         const census = stale.length;
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
@@ -2145,40 +2166,64 @@ async function embedAllStale(
           const metered = await meterPageBatch(engine, pageRow, existing.filter(c => !c.embedded_at), { signature, announceHeld: true });
           if (!metered) return;
           if (metered.grant) stale = metered.chunks.map(c => ({ ...(selected.get(c.chunk_index) ?? { source_id: keySourceId, slug, page_id: pageRow.id }), ...c }));
-          const { embeddings, failed, firstError } = await spendGrant(metered.grant, () => embedPageTexts(
-            wrapChunkTextsForStoredMode(pageRow, stale), { abortSignal: effectiveSignal }));
-          const staleIdxToEmbedding = new Map<number, Float32Array>();
-          for (let j = 0; j < stale.length; j++) {
-            const emb = embeddings[j];
-            if (emb) staleIdxToEmbedding.set(stale[j].chunk_index, emb);
-          }
-          // preserveCodeMetadata threads code-chunk metadata (#769) so the
-          // autopilot --stale path doesn't clobber language/symbol_name/etc
-          // to NULL on every cycle.
-          const merged: ChunkInput[] = existing.map(c => preserveCodeMetadata(c, {
-            chunk_index: c.chunk_index,
-            chunk_text: c.chunk_text,
-            chunk_source: c.chunk_source,
-            embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
-            token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
-          }));
-          // The last batch stamps from complete DB provenance (#4825).
-          // Keep both stamps with vector installation so later contextual
-          // work cannot commit between installation and title-tier demotion.
-          const install = await observed(pacer, () => engine.transaction(async tx => {
-            await staleOpts?.assertOwned?.(tx);
-            await lease.assertHeld(tx);
-            const installed = await installPageEmbeddings(tx, prepared, merged);
-            if (stamp && failed === 0) await stampIfPageProvenanceComplete(tx, slug, keySourceId, stamp);
-            if (failed === 0 && stale.length === existing.length && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, keySourceId);
-            return installed;
-          }));
-          if (!install.complete && install.installed === 0) return;
-          result.embedded += install.installed;
-          if (failed > 0) {
-            recordFailure(result, failed, slug, firstError);
-            serr(`\n  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${stale.length - failed}`);
-            await healAndReportOverLength(engine, slug, keySourceId, firstError, stale.map(c => c.chunk_text), serr);
+          // Lazurio: an unmetered page installs every INSTALL_EVERY chunks, so a
+          // budget that stops the drain mid-page keeps the slices it finished
+          // and the next run goes on from there. A metered page keeps one call:
+          // its grant settles once.
+          const pending = stale;
+          const sliced = !metered.grant && INSTALL_EVERY !== null;
+          const slices = staleInstallSlices(pending, sliced ? INSTALL_EVERY : null);
+          let failedSoFar = 0;
+          let completeSoFar = true;
+          for (let s = 0; s < slices.length; s++) {
+            if (s > 0 && effectiveSignal.aborted) return;
+            const slice = slices[s];
+            const lastSlice = s === slices.length - 1;
+            const { embeddings, failed, firstError } = await spendGrant(metered.grant, () => embedPageTexts(
+              wrapChunkTextsForStoredMode(pageRow, slice), { abortSignal: effectiveSignal }));
+            const staleIdxToEmbedding = new Map<number, Float32Array>();
+            for (let j = 0; j < slice.length; j++) {
+              const emb = embeddings[j];
+              if (emb) staleIdxToEmbedding.set(slice[j].chunk_index, emb);
+            }
+            // preserveCodeMetadata threads code-chunk metadata (#769) so the
+            // autopilot --stale path doesn't clobber language/symbol_name/etc
+            // to NULL on every cycle.
+            const merged: ChunkInput[] = existing.map(c => preserveCodeMetadata(c, {
+              chunk_index: c.chunk_index,
+              chunk_text: c.chunk_text,
+              chunk_source: c.chunk_source,
+              embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+              token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+            }));
+            const cleanSoFar = failedSoFar + failed === 0;
+            // The last batch stamps from complete DB provenance (#4825).
+            // Keep both stamps with vector installation so later contextual
+            // work cannot commit between installation and title-tier demotion.
+            const install = await observed(pacer, () => engine.transaction(async tx => {
+              await staleOpts?.assertOwned?.(tx);
+              await lease.assertHeld(tx);
+              const installed = await installPageEmbeddings(tx, prepared, merged);
+              if (lastSlice && stamp && cleanSoFar) await stampIfPageProvenanceComplete(tx, slug, keySourceId, stamp);
+              // A sliced page may finish in a later run than it started, so its
+              // demotion reads page-wide completion from the stored provenance
+              // instead of this run's own share of it.
+              const demote = lastSlice && cleanSoFar && completeSoFar && installed.complete
+                && (sliced ? await pageVectorsInPlainTier(tx, prepared) : pending.length === existing.length);
+              if (demote) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, keySourceId);
+              return installed;
+            }));
+            if (!install.complete && install.installed === 0) return;
+            completeSoFar &&= install.complete;
+            failedSoFar += failed;
+            result.embedded += install.installed;
+            unsettled = slices.slice(s + 1).flat();
+            if (install.installed > 0) _embedFailureCounts.delete(key);
+            if (failed > 0) {
+              recordFailure(result, failed, slug, firstError);
+              serr(`\n  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${slice.length - failed}`);
+              await healAndReportOverLength(engine, slug, keySourceId, firstError, slice.map(c => c.chunk_text), serr);
+            }
           }
           // #3622: reaching here means at least one chunk persisted (a total
           // embed failure throws) — progress, so the quarantine counter resets.
@@ -2187,9 +2232,10 @@ async function embedAllStale(
           // Budget/abort-fired cancellations are expected on the way out; don't
           // spam per-page "Error embedding" lines when we're shutting down.
           if (effectiveSignal.aborted) return;
-          recordFailure(result, stale.length, slug, e);
+          const owed = unsettled ?? stale;
+          recordFailure(result, owed.length, slug, e);
           serr(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
-          noteEmbedQuarantineFailure(key, slug); await healAndReportOverLength(engine, slug, keySourceId, e, stale.map(c => c.chunk_text), serr);
+          noteEmbedQuarantineFailure(key, slug); await healAndReportOverLength(engine, slug, keySourceId, e, owed.map(c => c.chunk_text), serr);
         } finally {
           const tally = staleProgress.pageDone(census, stale.length); onProgress?.(tally.done, tally.total, result.embedded);
         }

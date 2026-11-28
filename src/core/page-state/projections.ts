@@ -477,6 +477,34 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
   });
 }
 
+/**
+ * Lazurio (a stale page installed in slices, possibly over several runs):
+ * whether every chunk of the page now holds a vector of the page's plain
+ * re-embed input (`plainEmbeddingTier` of its stored mode, the provenance
+ * hash `installPageEmbeddings` records), so the page as a whole is in that
+ * tier. False where the page, its indexing context or its chunk set moved
+ * since `prepared`, or a chunk has no vector or another input's. Read in the
+ * caller's transaction, after its install.
+ */
+export async function pageVectorsInPlainTier(tx: BrainEngine, prepared: ProjectionSnapshot): Promise<boolean> {
+  const { snapshot } = prepared;
+  const sourceId = snapshot.page.source_id;
+  const slug = snapshot.page.slug;
+  const current = await tx.readPageSnapshot(slug, { sourceId });
+  if (!current || current.page.deleted_at || current.page.id !== snapshot.page.id || current.revision !== snapshot.revision
+    || current.sourceIncarnation !== snapshot.sourceIncarnation || isSegmentedPage(current.page)) return false;
+  const context = await indexingContext(tx, current, prepared.maxChunkTokensOverride);
+  if (context.key !== prepared.indexingContext) return false;
+  const col = quoteIdentifier(context.column.name);
+  const rows = await tx.executeRaw<{ chunk_text: string; chunk_source: string | null; embedding_input_hash: string | null; has_vector: boolean }>(
+    `SELECT chunk_text, chunk_source, embedding_input_hash, (${col} IS NOT NULL) AS has_vector
+       FROM content_chunks WHERE page_id=$1 ORDER BY chunk_index`, [snapshot.page.id]);
+  if (rows.length === 0) return false;
+  const input = embeddingInputContext(context, current.page.title, context.corpusGeneration, rows);
+  const tier = plainEmbeddingTier(current.page.contextual_retrieval_mode);
+  return rows.every(row => row.has_vector && row.embedding_input_hash === embeddingInputHash(input, tier, row));
+}
+
 /** Queue the latest revision even when its worktree owner is unavailable. */
 export async function queuePageProjection(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, slug: string, reason: string): Promise<void> {
   await engine.executeRaw(`INSERT INTO page_projection_jobs(source_incarnation,slug,revision,reason)

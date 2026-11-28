@@ -8,6 +8,7 @@ import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
 import { staleEmbedArgs, validateStaleEmbedOptions, type StaleEmbedOptions, type StaleEmbedOutcome } from '../core/persistence/embed-stale-administration.ts';
 import { OperationError, opError } from '../core/ops/contract.ts';
 import { BUDGET_STOP_EXIT_CODE } from '../core/exit-codes.ts';
+import { staleInstallEvery } from '../core/embed-install-every.ts';
 import { jsonRequested, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { isConsentRefusal, printConsentRefusal, requireConsent, type ConfirmationPayload, type ConsentEnv, type ConsentRefusal } from '../core/consent.ts';
 import { isInteractive } from '../core/interaction.ts';
@@ -57,8 +58,10 @@ export function staleEmbedOptionsFromArgs(args: string[], env: Record<string, st
     throw opError('invalid_params', `--max-usd needs a positive number of dollars, not ${JSON.stringify(usd)}`, 'Pass --max-usd with the cap the user approved, e.g. --max-usd 1.');
   }
   const source = value(['--source']);
+  const installEvery = staleInstallEvery(env);
   return validateStaleEmbedOptions({
     budgetMs: cliStaleBudgetMs(env),
+    ...(installEvery !== null ? { installEvery } : {}),
     ...(source !== undefined ? { sourceId: source } : {}),
     ...(args.includes('--dry-run') ? { dryRun: true } : {}),
     ...(args.includes('--yes') ? { yes: true } : {}),
