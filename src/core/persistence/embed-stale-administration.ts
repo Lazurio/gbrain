@@ -32,6 +32,8 @@ export interface StaleEmbedOptions {
   maxUsd?: number;
   /** The CLI's --quiet: the drain's own summary lines (healed pages, the totals) are dropped, as on the direct path. */
   quiet?: boolean;
+  /** Lazurio: the CLI's GBRAIN_EMBED_STALE_INSTALL_EVERY, never the server's (EmbedOpts.installEvery). */
+  installEvery?: number;
 }
 
 /** `err`: what the CLI's run writes to stderr; `out`: its stdout verdicts (stderr under --json). */
@@ -40,7 +42,7 @@ export interface StaleEmbedOutcome { result?: EmbedResult; refusal?: Confirmatio
 
 export function validateStaleEmbedOptions(value: unknown): StaleEmbedOptions {
   const raw = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
-  const allowed = ['sourceId', 'dryRun', 'budgetMs', 'yes', 'maxUsd', 'quiet'];
+  const allowed = ['sourceId', 'dryRun', 'budgetMs', 'yes', 'maxUsd', 'quiet', 'installEvery'];
   const extra = Object.keys(raw).filter(key => !allowed.includes(key));
   if (extra.length > 0) {
     throw opError('invalid_params', `Unknown stale embedding option ${extra[0]}`,
@@ -65,6 +67,13 @@ export function validateStaleEmbedOptions(value: unknown): StaleEmbedOptions {
       throw opError('invalid_params', 'maxUsd must be a positive number of dollars', 'Pass --max-usd with the cap the user approved, e.g. --max-usd 1.');
     }
     options.maxUsd = raw.maxUsd;
+  }
+  if (raw.installEvery !== undefined) {
+    if (typeof raw.installEvery !== 'number' || !Number.isInteger(raw.installEvery) || raw.installEvery < 1 || raw.installEvery > 999_999) {
+      throw opError('invalid_params', 'installEvery must be a whole number of chunks, at least 1',
+        'Set GBRAIN_EMBED_STALE_INSTALL_EVERY to a whole number of chunks, or unset it for one install per page.');
+    }
+    options.installEvery = raw.installEvery;
   }
   return options;
 }
@@ -132,6 +141,8 @@ export async function runAuthenticatedStaleEmbedding(engine: BrainEngine, params
         stale: true, quiet: options.quiet === true, singleFlight: true,
         signal: costCap ? AbortSignal.any([controller.signal, costCap.signal]) : controller.signal,
         timeBudgetMs: options.budgetMs,
+        // The CLI's setting, or none: never this owner's own environment.
+        installEvery: options.installEvery ?? null,
         ...(options.sourceId ? { sourceId: options.sourceId } : {}),
         ...(options.dryRun ? { dryRun: true } : {}),
       };

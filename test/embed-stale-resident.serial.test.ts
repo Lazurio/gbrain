@@ -172,6 +172,50 @@ describe('the budget is the CLI\'s', () => {
   }, { GBRAIN_EMBED_TIME_BUDGET_MS: '5000' }), 60_000);
 });
 
+describe('the install interval is the CLI\'s (Lazurio), never the owner\'s', () => {
+  const twelveChunks = async () => {
+    // Seeded directly, as beforeEach seeds its pages: the writer coordinator is off while the fixture is written.
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    const texts = Array.from({ length: 12 }, (_, i) => `Paragraph ${i} of a larger page.`);
+    await engine.putPage('notes/larger', { type: 'note', title: 'larger', compiled_truth: texts.join('\n\n') });
+    await installFixtureChunks(engine, 'notes/larger', texts.map((chunk_text, chunk_index) => ({ chunk_index, chunk_text, chunk_source: 'compiled_truth' as const, token_count: 8 })));
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+  };
+
+  test('a CLI without the setting runs one install per page on an owner that has it set, and a CLI with it slices on an owner without', () => inHome(async () => {
+    const core = spyOn(embedModule, 'runEmbedCore');
+    try {
+      // The child would inherit the owner's setting: it is the CLI without one.
+      const unset = await cli(['--dry-run', '--json'], { GBRAIN_EMBED_STALE_INSTALL_EVERY: undefined });
+      expect({ status: unset.status, stderr: unset.stderr }).toMatchObject({ status: 0 });
+      expect(process.env.GBRAIN_EMBED_STALE_INSTALL_EVERY).toBe('4');
+      expect(core.mock.calls.at(-1)?.[1]).toMatchObject({ stale: true, installEvery: null });
+      const set = await cli(['--dry-run', '--json'], { GBRAIN_EMBED_STALE_INSTALL_EVERY: '7' });
+      expect(set.status).toBe(0);
+      expect(core.mock.calls.at(-1)?.[1]).toMatchObject({ stale: true, installEvery: 7 });
+    } finally { core.mockRestore(); }
+  }, { GBRAIN_EMBED_STALE_INSTALL_EVERY: '4' }), 60_000);
+
+  test('with opposing settings the CLI\'s decides how the page is installed', () => inHome(async () => {
+    await twelveChunks();
+    // The owner has 4; the CLI has none: one model call for each of the four pages.
+    const unset = await cli(['--yes', '--json'], { GBRAIN_EMBED_STALE_INSTALL_EVERY: undefined });
+    expect({ status: unset.status, stderr: unset.stderr }).toMatchObject({ status: 0 });
+    expect(JSON.parse(unset.stdout)).toMatchObject({ embedded: SLUGS.length + 12, failures: 0 });
+    expect(calls).toBe(SLUGS.length + 1);
+    expect(await stale()).toBe(0);
+  }, { GBRAIN_EMBED_STALE_INSTALL_EVERY: '4' }), 60_000);
+
+  test('a CLI with 4 slices the 12-chunk page into three installs on an owner without the setting', () => inHome(async () => {
+    await twelveChunks();
+    const set = await cli(['--yes', '--json'], { GBRAIN_EMBED_STALE_INSTALL_EVERY: '4' });
+    expect({ status: set.status, stderr: set.stderr }).toMatchObject({ status: 0 });
+    expect(JSON.parse(set.stdout)).toMatchObject({ embedded: SLUGS.length + 12, failures: 0 });
+    expect(calls).toBe(SLUGS.length + 3);
+    expect(await stale()).toBe(0);
+  }, { GBRAIN_EMBED_STALE_INSTALL_EVERY: undefined }), 60_000);
+});
+
 describe('the chunkless-page heal takes the CLI\'s budget too', () => {
   const chunkless = async (n: number) => {
     // Seeded directly, as beforeEach seeds its pages: the writer coordinator is off while the fixture is written.
